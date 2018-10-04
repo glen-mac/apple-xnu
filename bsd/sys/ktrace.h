@@ -1,217 +1,135 @@
 /*
- * Copyright (c) 2000-2005 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2015 Apple Inc. All rights reserved.
  *
- * @APPLE_LICENSE_HEADER_START@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
- * The contents of this file constitute Original Code as defined in and
- * are subject to the Apple Public Source License Version 1.1 (the
- * "License").  You may not use this file except in compliance with the
- * License.  Please obtain a copy of the License at
- * http://www.apple.com/publicsource and read it before using this file.
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
  * 
- * This Original Code and all software distributed under the License are
- * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
  * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
- * License for the specific language governing rights and limitations
- * under the License.
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
  * 
- * @APPLE_LICENSE_HEADER_END@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-/* Copyright (c) 1995 NeXT Computer, Inc. All Rights Reserved */
+
+#ifndef SYS_KTRACE_H
+#define SYS_KTRACE_H
+
+#include <stdint.h>
+
+#include <kern/locks.h>
+
+/* The states that ktrace can be in. */
+enum ktrace_state {
+	/* No tool has configured ktrace. */
+	KTRACE_STATE_OFF = 0,
+	/* A foreground tool has configured ktrace. */
+	KTRACE_STATE_FG,
+	/* A background tool has configured ktrace. */
+	KTRACE_STATE_BG
+};
+
+extern lck_mtx_t *ktrace_lock;
+
 /*
- * Copyright (c) 1988, 1993
- *	The Regents of the University of California.  All rights reserved.
+ * Subsystems that use ktrace to manage ownership.  These values are passed as
+ * part of the `*_mask` arguments in `ktrace_configure` and `ktrace_reset`.
+ */
+#define KTRACE_KDEBUG (1 << 0)
+#define KTRACE_KPERF  (1 << 1)
+
+/*
+ * Used by subsystems to inform ktrace that a configuration is occurring.
+ * Validates whether the current process has privileges to configure
+ * ktrace.  Pass the subsystem(s) being configured in config_mask.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
+ * `ktrace_lock` must be held.
  *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * Returns 0 if configuration is allowed, EPERM if process is not privileged,
+ * and EBUSY if ktrace is owned by another process.
+ */
+int ktrace_configure(uint32_t config_mask);
+
+/*
+ * Tell ktrace to reset a configuration.  Pass the susbsystem(s) that are to
+ * be reset in the reset_mask.
  *
- *	@(#)ktrace.h	8.1 (Berkeley) 6/2/93
- * $FreeBSD: src/sys/sys/ktrace.h,v 1.19.2.3 2001/01/06 09:58:23 alfred Exp $
+ * `ktrace_lock` must be held.
  */
-
-#ifndef _SYS_KTRACE_H_
-#define	_SYS_KTRACE_H_
-
-#include <sys/appleapiopts.h>
-
-#ifdef MACH_KERNEL_PRIVATE
-
-void ktrsyscall(void *, int, int, void *);
-void ktrsysret(void *, int, int, int);
-
-#else
-#ifdef __APPLE_API_UNSTABLE
-/*
- * operations to ktrace system call  (KTROP(op))
- */
-#define KTROP_SET		0	/* set trace points */
-#define KTROP_CLEAR		1	/* clear trace points */
-#define KTROP_CLEARFILE		2	/* stop all tracing to file */
-#define	KTROP(o)		((o)&3)	/* macro to extract operation */
-/*
- * flags (ORed in with operation)
- */
-#define KTRFLAG_DESCEND		4	/* perform op on all children too */
+void ktrace_reset(uint32_t reset_mask);
 
 /*
- * ktrace record header
+ * Determine if the current process can read the configuration of ktrace.
+ * Only the owning process or a root privileged process is allowed.
  *
- * LP64todo: not 64-bit safe
+ * `ktrace_lock` must be held.
+ *
+ * Returns 0 if allowed, EPERM otherwise.
  */
-struct ktr_header {
-	int	ktr_len;		/* length of buf */
-	short	ktr_type;		/* trace record type */
-	pid_t	ktr_pid;		/* process id */
-	char	ktr_comm[MAXCOMLEN+1];	/* command name */
-	struct	timeval ktr_time;	/* timestamp */
-	caddr_t	ktr_buf;
-};
+int ktrace_read_check(void);
 
 /*
- * Test for kernel trace point
+ * With certain boot-args, the kernel can start tracing without user space
+ * intervention.  With `trace=<n_events>`, the kernel will start tracing at
+ * boot.  With `trace_wake=<n_events>`, the kernel will start tracing on the
+ * wake path out of hibernation (on Intel only).
+ *
+ * In these cases, ktrace must be aware of the state changes.  This function
+ * should be called whenever the kernel initiates configuring ktrace.
+ *
+ * `ktrace_lock` must be held.
  */
-#define KTRPOINT(p, type)	\
-	(((p)->p_traceflag & ((1<<(type))|KTRFAC_ACTIVE)) == (1<<(type)))
+void ktrace_kernel_configure(uint32_t config_mask);
 
 /*
- * ktrace record types
+ * This KPI allows kernel systems to disable ktrace.  ktrace will only be
+ * disabled if the state matches the provided state_to_match.
+ *
+ * This does not reset the configuration of any subsystems -- it just makes
+ * them stop logging events or sampling data.
+ *
+ * `ktrace_lock` must be held.
  */
+void ktrace_disable(enum ktrace_state state_to_match);
 
 /*
- * KTR_SYSCALL - system call record
+ * Returns the pid of the process that owns ktrace.  If ktrace is unowned,
+ * returns 0.
+ *
+ * `ktrace_lock` must be held.
  */
-#define KTR_SYSCALL	1
-struct ktr_syscall {
-	short	ktr_code;		/* syscall number */
-	short	ktr_narg;		/* number of arguments */
-	/*
-	 * followed by ktr_narg register_t
-	 */
-	u_int64_t	ktr_args[1];
-};
+int ktrace_get_owning_pid(void);
 
 /*
- * KTR_SYSRET - return from system call record
+ * Returns true if background tracing is active, false otherwise.
+ *
+ * `ktrace_lock` must be held.
  */
-#define KTR_SYSRET	2
-struct ktr_sysret {
-	short	ktr_code;
-	short	ktr_eosys;
-	int	ktr_error;
-	register_t	ktr_retval;
-};
+bool ktrace_background_active(void);
 
 /*
- * KTR_NAMEI - namei record
+ * These functions exist for the transition for kperf to allow blessing other
+ * processes.  They should not be used by other clients.
  */
-#define KTR_NAMEI	3
-	/* record contains pathname */
+extern boolean_t ktrace_keep_ownership_on_reset;
+extern int ktrace_root_set_owner_allowed;
+int ktrace_set_owning_pid(int pid);
 
-/*
- * KTR_GENIO - trace generic process i/o
- */
-#define KTR_GENIO	4
-struct ktr_genio {
-	int	ktr_fd;
-	enum	uio_rw ktr_rw;
-	/*
-	 * followed by data successfully read/written
-	 */
-};
+/* Initialize ktrace.  Must only be called by the bootstrap thread. */
+void ktrace_init(void);
 
-/*
- * KTR_PSIG - trace processed signal
- */
-#define	KTR_PSIG	5
-struct ktr_psig {
-	int	signo;
-	sig_t	action;
-	int	code;
-	sigset_t mask;
-};
-
-/*
- * KTR_CSW - trace context switches
- */
-#define KTR_CSW		6
-struct ktr_csw {
-	int	out;	/* 1 if switch out, 0 if switch in */
-	int	user;	/* 1 if usermode (ivcsw), 0 if kernel (vcsw) */
-};
-
-/*
- * KTR_USER - data comming from userland
- */
-#define	KTR_USER_MAXLEN	2048	/* maximum length of passed data */
-#define KTR_USER	7
-
-/*
- * kernel trace points (in p_traceflag)
- */
-#define KTRFAC_MASK	0x00ffffff
-#define KTRFAC_SYSCALL	(1<<KTR_SYSCALL)
-#define KTRFAC_SYSRET	(1<<KTR_SYSRET)
-#define KTRFAC_NAMEI	(1<<KTR_NAMEI)
-#define KTRFAC_GENIO	(1<<KTR_GENIO)
-#define	KTRFAC_PSIG	(1<<KTR_PSIG)
-#define KTRFAC_CSW	(1<<KTR_CSW)
-#define KTRFAC_USER	(1<<KTR_USER)
-/*
- * trace flags (also in p_traceflags)
- */
-#define KTRFAC_ROOT	0x80000000	/* root set this trace */
-#define KTRFAC_INHERIT	0x40000000	/* pass trace flags to children */
-#define KTRFAC_ACTIVE	0x20000000	/* ktrace logging in progress, ignore */
-
-
-#ifdef	KERNEL
-#ifdef __APPLE_API_PRIVATE
-void	ktrnamei(struct vnode *,char *);
-void	ktrcsw(struct vnode *, int, int);
-void	ktrpsig(struct vnode *, int, sig_t, sigset_t *, int);
-void	ktrgenio(struct vnode *, int, enum uio_rw, struct uio *, int);
-void	ktrsyscall(struct proc *, int, int, syscall_arg_t args[]);
-void	ktrsysret(struct proc *, int, int, register_t);
-#endif /* __APPLE_API_PRIVATE */
-#else
-
-#include <sys/cdefs.h>
-
-__BEGIN_DECLS
-int	ktrace(const char *, int, int, pid_t);
-int	utrace(const void *, size_t);
-__END_DECLS
-
-#endif	/* !KERNEL */
-
-#endif /* __APPLE_API_UNSTABLE */
-#endif /* !MACH_KERNEL_PRIVATE */
-#endif /* !_SYS_KTRACE_H_ */
-
+#endif /* SYS_KTRACE_H */

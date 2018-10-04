@@ -1,622 +1,519 @@
 /*
- * Copyright (c) 2000-2004 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2015 Apple Inc. All rights reserved.
  *
- * @APPLE_LICENSE_HEADER_START@
- * 
- * The contents of this file constitute Original Code as defined in and
- * are subject to the Apple Public Source License Version 1.1 (the
- * "License").  You may not use this file except in compliance with the
- * License.  Please obtain a copy of the License at
- * http://www.apple.com/publicsource and read it before using this file.
- * 
- * This Original Code and all software distributed under the License are
- * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
+ *
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ *
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ *
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
  * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
- * License for the specific language governing rights and limitations
- * under the License.
- * 
- * @APPLE_LICENSE_HEADER_END@
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
-/* Copyright (c) 1995 NeXT Computer, Inc. All Rights Reserved */
+
 /*
- * Copyright (c) 1989, 1993
- *	The Regents of the University of California.  All rights reserved.
+ * This file manages the ownership of ktrace and its subsystems, like kdebug
+ * and kperf, as well as the overall state of the system, whether it is in
+ * foreground or background mode.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
- * 4. Neither the name of the University nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
+ * When unconfigured or in background mode, any root process can take ownership
+ * of ktrace and configure it, changing the state to foreground and, in the case
+ * of a transition out of background, resetting the background configuration.
  *
- * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * When in foreground mode, if the owning process is still running, only it may
+ * configure ktrace.  If it exits, ktrace keeps running but any root process can
+ * change the configuration.  When ktrace is reset, the state changes back to
+ * unconfigured and a notification is sent on the ktrace_background host special
+ * port.
  *
- *	@(#)kern_ktrace.c	8.2 (Berkeley) 9/23/93
- * $FreeBSD: src/sys/kern/kern_ktrace.c,v 1.35.2.4 2001/03/05 13:09:01 obrien Exp $
+ * If a process has set itself as the background tool, using the init_background
+ * sysctl, it can configure ktrace only when ktrace is off or already in
+ * background mode.  The first attempt to configure ktrace by the background pid
+ * when it is off results in the transition to background mode.
  */
 
-
-#include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/types.h>
-#include <sys/proc_internal.h>
-#include <sys/kauth.h>
-#include <sys/file_internal.h>
-#include <sys/namei.h>
-#include <sys/vnode_internal.h>
-#if KTRACE
 #include <sys/ktrace.h>
-#endif
-#include <sys/malloc.h>
-#include <sys/syslog.h>
-#include <sys/sysproto.h>
-#include <sys/uio_internal.h>
 
-#include <bsm/audit_kernel.h>
+#include <mach/host_priv.h>
+#include <mach/mach_types.h>
+#include <mach/ktrace_background.h>
 
-#if KTRACE
-static struct ktr_header *ktrgetheader(int type);
-static void ktrwrite(struct vnode *, struct ktr_header *, struct uio *);
-static int ktrcanset(struct proc *,struct proc *);
-static int ktrsetchildren(struct proc *,struct proc *,
-	int, int, struct vnode *);
-static int ktrops(struct proc *,struct proc *,int,int,struct vnode *);
+#include <sys/kauth.h>
+#include <sys/priv.h>
+#include <sys/proc.h>
+char *proc_name_address(void *p);
+#include <sys/sysctl.h>
+#include <sys/vm.h>
 
+#include <kern/locks.h>
+#include <kern/assert.h>
 
-static struct ktr_header *
-ktrgetheader(type)
-	int type;
-{
-	register struct ktr_header *kth;
-	struct proc *p = current_proc();	/* XXX */
+#include <sys/kdebug.h>
+#include <kperf/kperf.h>
 
-	MALLOC(kth, struct ktr_header *, sizeof (struct ktr_header),
-		M_KTRACE, M_WAITOK);
-	if (kth != NULL) {
-		kth->ktr_type = type;
-		microtime(&kth->ktr_time);
-		kth->ktr_pid = p->p_pid;
-		bcopy(p->p_comm, kth->ktr_comm, MAXCOMLEN);
-	}
-	return (kth);
-}
-#endif
+#include <kern/host.h>
 
-void
-ktrsyscall(p, code, narg, args)
-	struct proc *p;
-	int code, narg;
-	syscall_arg_t args[];
-{
-#if KTRACE
-	struct vnode *vp;
-	struct	ktr_header *kth;
-	struct	ktr_syscall *ktp;
-	register int len;
-	u_int64_t *argp;
-	int i;
+kern_return_t ktrace_background_available_notify_user(void);
 
-	if (!KTRPOINT(p, KTR_SYSCALL))
-		return;
-
-	vp = p->p_tracep;
-	len = __offsetof(struct ktr_syscall, ktr_args) +
-	    (narg * sizeof(u_int64_t));
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_SYSCALL);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return;
-	}
-	MALLOC(ktp, struct ktr_syscall *, len, M_KTRACE, M_WAITOK);
-	if (ktp == NULL) {
-		FREE(kth, M_KTRACE);
-		return;
-	}
-	ktp->ktr_code = code;
-	ktp->ktr_narg = narg;
-	argp = &ktp->ktr_args[0];
-	for (i = 0; i < narg; i++)
-		*argp++ = args[i];
-	kth->ktr_buf = (caddr_t)ktp;
-	kth->ktr_len = len;
-	ktrwrite(vp, kth, NULL);
-	FREE(ktp, M_KTRACE);
-	FREE(kth, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-#else
-	return;
-#endif
-}
- 
-void
-ktrsysret(p, code, error, retval)
-	struct proc *p;
-	int code, error;
-	register_t retval;
-{
-#if KTRACE
-	struct vnode *vp;
-	struct ktr_header *kth;
-	struct ktr_sysret ktp;
-
-	if (!KTRPOINT(p, KTR_SYSRET))
-		return;
-
-	vp = p->p_tracep;
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_SYSRET);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return;
-	}
-	ktp.ktr_code = code;
-	ktp.ktr_error = error;
-	ktp.ktr_retval = retval;		/* what about val2 ? */
-
-	kth->ktr_buf = (caddr_t)&ktp;
-	kth->ktr_len = sizeof(struct ktr_sysret);
-
-	ktrwrite(vp, kth, NULL);
-	FREE(kth, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-#else
-	return;
-#endif
-}
-
-#if KTRACE
-void
-ktrnamei(vp, path)
-	struct vnode *vp;
-	char *path;
-{
-	struct ktr_header *kth;
-	struct proc *p = current_proc();	/* XXX */
-
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_NAMEI);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return;
-	}
-	kth->ktr_len = strlen(path);
-	kth->ktr_buf = path;
-
-	ktrwrite(vp, kth, NULL);
-	FREE(kth, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-}
-
-void
-ktrgenio(vp, fd, rw, uio, error)
-	struct vnode *vp;
-	int fd;
-	enum uio_rw rw;
-	struct uio *uio;
-	int error;
-{
-	struct ktr_header *kth;
-	struct ktr_genio ktg;
-	struct proc *p = current_proc();	/* XXX */
-
-	if (error)
-		return;
-
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_GENIO);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return;
-	}
-	ktg.ktr_fd = fd;
-	ktg.ktr_rw = rw;
-	kth->ktr_buf = (caddr_t)&ktg;
-	kth->ktr_len = sizeof(struct ktr_genio);
-	uio->uio_offset = 0;
-	uio->uio_rw = UIO_WRITE;
-
-	ktrwrite(vp, kth, uio);
-	FREE(kth, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-}
-
-void
-ktrpsig(vp, sig, action, mask, code)
-	struct vnode *vp;
-	int sig;
-	sig_t action;
-	sigset_t *mask;
-	int code;
-{
-	struct ktr_header *kth;
-	struct ktr_psig	kp;
-	struct proc *p = current_proc();	/* XXX */
-
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_PSIG);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return;
-	}
-	kp.signo = (char)sig;
-	kp.action = action;
-	kp.mask = *mask;
-	kp.code = code;
-	kth->ktr_buf = (caddr_t)&kp;
-	kth->ktr_len = sizeof (struct ktr_psig);
-
-	ktrwrite(vp, kth, NULL);
-	FREE(kth, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-}
-
-void
-ktrcsw(vp, out, user)
-	struct vnode *vp;
-	int out, user;
-{
-	struct ktr_header *kth;
-	struct	ktr_csw kc;
-	struct proc *p = current_proc();	/* XXX */
-
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_CSW);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return;
-	}
-	kc.out = out;
-	kc.user = user;
-	kth->ktr_buf = (caddr_t)&kc;
-	kth->ktr_len = sizeof (struct ktr_csw);
-
-	ktrwrite(vp, kth, NULL);
-	FREE(kth, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-}
-#endif /* KTRACE */
-
-/* Interface and common routines */
+lck_mtx_t *ktrace_lock;
 
 /*
- * ktrace system call
+ * The overall state of ktrace, whether it is unconfigured, in foreground mode,
+ * or in background mode.  The state determines which processes can configure
+ * ktrace.
  */
-/* ARGSUSED */
-int
-ktrace(struct proc *curp, register struct ktrace_args *uap, __unused register_t *retval)
-{
-#if KTRACE
-	register struct vnode *vp = NULL;
-	register struct proc *p;
-	struct pgrp *pg;
-	int facs = uap->facs & ~KTRFAC_ROOT;
-	int ops = KTROP(uap->ops);
-	int descend = uap->ops & KTRFLAG_DESCEND;
-	int ret = 0;
-	int error = 0;
-	struct nameidata nd;
-	struct vfs_context context;
+static enum ktrace_state ktrace_state = KTRACE_STATE_OFF;
 
-	AUDIT_ARG(cmd, uap->ops);
-	AUDIT_ARG(pid, uap->pid);
-	AUDIT_ARG(value, uap->facs);
-
-	context.vc_proc = curp;
-	context.vc_ucred = kauth_cred_get();
-
-	curp->p_traceflag |= KTRFAC_ACTIVE;
-	if (ops != KTROP_CLEAR) {
-		/*
-		 * an operation which requires a file argument.
-		 */
-		NDINIT(&nd, LOOKUP, (NOFOLLOW|LOCKLEAF), UIO_USERSPACE, 
-			   uap->fname, &context);
-		error = vn_open(&nd, FREAD|FWRITE|O_NOFOLLOW, 0);
-		if (error) {
-			curp->p_traceflag &= ~KTRFAC_ACTIVE;
-			return (error);
-		}
-		vp = nd.ni_vp;
-
-		if (vp->v_type != VREG) {
-			(void) vn_close(vp, FREAD|FWRITE, kauth_cred_get(), curp);
-			(void) vnode_put(vp);
-
-			curp->p_traceflag &= ~KTRFAC_ACTIVE;
-			return (EACCES);
-		}
-	}
-	/*
-	 * Clear all uses of the tracefile
-	 */
-	if (ops == KTROP_CLEARFILE) {
-		LIST_FOREACH(p, &allproc, p_list) {
-			if (p->p_tracep == vp) {
-				if (ktrcanset(curp, p)) {
-					struct vnode *tvp = p->p_tracep;
-					/* no more tracing */
-					p->p_traceflag = 0;
-					if (tvp != NULL) {
-						p->p_tracep = NULL;
-						vnode_rele(tvp);
-					}
-				} else
-					error = EPERM;
-			}
-		}
-		goto done;
-	}
-
-	/*
-	 * need something to (un)trace (XXX - why is this here?)
-	 */
-	if (!facs) {
-		error = EINVAL;
-		goto done;
-	}
-	/*
-	 * do it
-	 */
-	if (uap->pid < 0) {
-		/*
-		 * by process group
-		 */
-		pg = pgfind(-uap->pid);
-		if (pg == NULL) {
-			error = ESRCH;
-			goto done;
-		}
-		LIST_FOREACH(p, &pg->pg_members, p_pglist)
-			if (descend)
-				ret |= ktrsetchildren(curp, p, ops, facs, vp);
-			else
-				ret |= ktrops(curp, p, ops, facs, vp);
-
-	} else {
-		/*
-		 * by pid
-		 */
-		p = pfind(uap->pid);
-		if (p == NULL) {
-			error = ESRCH;
-			goto done;
-		}
-		AUDIT_ARG(process, p);
-		if (descend)
-			ret |= ktrsetchildren(curp, p, ops, facs, vp);
-		else
-			ret |= ktrops(curp, p, ops, facs, vp);
-	}
-	if (!ret)
-		error = EPERM;
-done:
-	if (vp != NULL) {
-		(void) vn_close(vp, FWRITE, kauth_cred_get(), curp);
-		(void) vnode_put(vp);
-	}
-	curp->p_traceflag &= ~KTRFAC_ACTIVE;
-	return (error);
-#else
-	return ENOSYS;
-#endif
-}
+/* The true owner of ktrace, checked by ktrace_access_check(). */
+static uint64_t ktrace_owning_unique_id = 0;
+static pid_t ktrace_owning_pid = 0;
 
 /*
- * utrace system call
+ * The background pid of ktrace, automatically made the owner when
+ * transitioning to background mode.
  */
+static uint64_t ktrace_bg_unique_id = 0;
+static pid_t ktrace_bg_pid = 0;
 
-/* ARGSUSED */
-int
-utrace(__unused struct proc *curp, register struct utrace_args *uap, __unused register_t *retval)
+/* The name of the last process to configure ktrace. */
+static char ktrace_last_owner_execname[MAXCOMLEN + 1] = { 0 };
+
+/*
+ * Which subsystems of ktrace (currently kdebug and kperf) are active.
+ */
+static uint32_t ktrace_active_mask = 0;
+
+/*
+ * At boot or when a daemon has been newly loaded, it's necessary to bootstrap
+ * user space background tools by sending a background available notification
+ * when the init_background sysctl is made.
+ *
+ * Background tools must be RunAtLoad daemons.
+ */
+static boolean_t should_notify_on_init = TRUE;
+
+/* Set the owning process of ktrace. */
+static void ktrace_set_owning_proc(proc_t p);
+
+/* Reset ktrace ownership back to unowned. */
+static void ktrace_release_ownership(void);
+
+/* Make the background tool the owner of ktrace. */
+static void ktrace_promote_background(void);
+
+/*
+ * If user space sets a pid manually (through kperf "blessing"), ktrace should
+ * not treat resets as releasing ownership.  At that point, ownership is only
+ * released when the owner is set to an invalid pid.
+ *
+ * This is managed by the user space-oriented function ktrace_set_owning_pid
+ * and ktrace_unset_owning_pid.
+ */
+boolean_t ktrace_keep_ownership_on_reset = FALSE;
+
+/* Allow user space to unset the owning pid and potentially reset ktrace. */
+static void ktrace_set_invalid_owning_pid(void);
+
+/*
+ * This flag allows any root process to set a new ktrace owner.  It is
+ * currently used by Instruments.
+ */
+int ktrace_root_set_owner_allowed = 0;
+
+void
+ktrace_reset(uint32_t reset_mask)
 {
-#if KTRACE
-	struct ktr_header *kth;
-	struct proc *p = current_proc();	/* XXX */
-	register caddr_t cp;
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+	assert(reset_mask != 0);
 
-	if (!KTRPOINT(p, KTR_USER))
-		return (0);
-	if (uap->len > KTR_USER_MAXLEN)
-		return (EINVAL);
-	p->p_traceflag |= KTRFAC_ACTIVE;
-	kth = ktrgetheader(KTR_USER);
-	if (kth == NULL) {
-		p->p_traceflag &= ~KTRFAC_ACTIVE;
-		return(ENOMEM);
-	}
-	MALLOC(cp, caddr_t, uap->len, M_KTRACE, M_WAITOK);
-	if (cp == NULL) {
-		FREE(kth, M_KTRACE);
-		return(ENOMEM);
-	}
-	if (copyin(uap->addr, cp, uap->len) == 0) {
-		kth->ktr_buf = cp;
-		kth->ktr_len = uap->len;
-		ktrwrite(p->p_tracep, kth, NULL);
-	}
-	FREE(kth, M_KTRACE);
-	FREE(cp, M_KTRACE);
-	p->p_traceflag &= ~KTRFAC_ACTIVE;
-
-	return (0);
-#else
-	return (ENOSYS);
-#endif
-}
-
-#if KTRACE
-static int
-ktrops(curp, p, ops, facs, vp)
-	struct proc *p, *curp;
-	int ops, facs;
-	struct vnode *vp;
-{
-	struct vnode *tvp;
-
-	if (!ktrcanset(curp, p))
-		return (0);
-	if (ops == KTROP_SET) {
-		if (p->p_tracep != vp) {
-			tvp = p->p_tracep;
-			vnode_ref(vp);
-			p->p_tracep = vp;
-
-			if (tvp != NULL) {
-			        /*
-				 * if trace file already in use, relinquish
-				 */
-				vnode_rele(tvp);
-			}
+	if (ktrace_active_mask == 0) {
+		if (!ktrace_keep_ownership_on_reset) {
+			assert(ktrace_state == KTRACE_STATE_OFF);
 		}
-		p->p_traceflag |= facs;
-		if (!suser(kauth_cred_get(), NULL))
-			p->p_traceflag |= KTRFAC_ROOT;
-	} else {
-		/* KTROP_CLEAR */
-		if (((p->p_traceflag &= ~facs) & KTRFAC_MASK) == 0) {
-			/* no more tracing */
-			tvp = p->p_tracep;
-			p->p_traceflag = 0;
-			if (tvp != NULL) {
-				p->p_tracep = NULL;
-				vnode_rele(tvp);
-			}
-		}
+		return;
 	}
 
-	return (1);
-}
+	if (!ktrace_keep_ownership_on_reset) {
+		ktrace_active_mask &= ~reset_mask;
+	}
 
-static int
-ktrsetchildren(curp, top, ops, facs, vp)
-	struct proc *curp, *top;
-	int ops, facs;
-	struct vnode *vp;
-{
-	register struct proc *p;
-	register int ret = 0;
+	if (reset_mask & KTRACE_KPERF) {
+		kperf_reset();
+	}
+	if (reset_mask & KTRACE_KDEBUG) {
+		kdebug_reset();
+	}
 
-	p = top;
-	for (;;) {
-		ret |= ktrops(curp, p, ops, facs, vp);
-		/*
-		 * If this process has children, descend to them next,
-		 * otherwise do any siblings, and if done with this level,
-		 * follow back up the tree (but not past top).
-		 */
-		if (!LIST_EMPTY(&p->p_children))
-			p = LIST_FIRST(&p->p_children);
-		else for (;;) {
-			if (p == top)
-				return (ret);
-			if (LIST_NEXT(p, p_sibling)) {
-				p = LIST_NEXT(p, p_sibling);
-				break;
-			}
-			p = p->p_pptr;
+	if (ktrace_active_mask == 0) {
+		if (ktrace_state == KTRACE_STATE_FG) {
+			/* transition from foreground to background */
+			ktrace_promote_background();
+		} else if (ktrace_state == KTRACE_STATE_BG) {
+			/* background tool is resetting ktrace */
+			should_notify_on_init = TRUE;
+			ktrace_release_ownership();
+			ktrace_state = KTRACE_STATE_OFF;
 		}
 	}
-	/*NOTREACHED*/
 }
 
 static void
-ktrwrite(struct vnode *vp, struct ktr_header *kth, struct uio *uio)
+ktrace_promote_background(void)
 {
-	uio_t auio;
-	register struct proc *p = current_proc();	/* XXX */
-	struct vfs_context context;
-	int error;
-	char uio_buf[ UIO_SIZEOF(2) ];
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+	assert(ktrace_state != KTRACE_STATE_BG);
 
-	if (vp == NULL)
+	/*
+	 * Remember to send a background available notification on the next init
+	 * if the notification failed (meaning no task holds the receive right
+	 * for the host special port).
+	 */
+	if (ktrace_background_available_notify_user() == KERN_FAILURE) {
+		should_notify_on_init = TRUE;
+	} else {
+		should_notify_on_init = FALSE;
+	}
+
+	ktrace_release_ownership();
+	ktrace_state = KTRACE_STATE_OFF;
+}
+
+bool
+ktrace_background_active(void)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+	return (ktrace_state == KTRACE_STATE_BG);
+}
+
+int
+ktrace_read_check(void)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+
+	if (proc_uniqueid(current_proc()) == ktrace_owning_unique_id)
+	{
+		return 0;
+	}
+
+	return kauth_cred_issuser(kauth_cred_get()) ? 0 : EPERM;
+}
+
+/* If an owning process has exited, reset the ownership. */
+static void
+ktrace_ownership_maintenance(void)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+
+	/* do nothing if ktrace is not owned */
+	if (ktrace_owning_unique_id == 0) {
 		return;
+	}
 
-	auio = uio_createwithbuffer(2, 0, UIO_SYSSPACE, UIO_WRITE, 
-								  &uio_buf[0], sizeof(uio_buf));
-	uio_addiov(auio, CAST_USER_ADDR_T(kth), sizeof(struct ktr_header));
-	context.vc_proc = p;
-	context.vc_ucred = kauth_cred_get();
-	
-	if (kth->ktr_len > 0) {
-		uio_addiov(auio, CAST_USER_ADDR_T(kth->ktr_buf), kth->ktr_len);
-		if (uio != NULL)
-			kth->ktr_len += uio_resid(uio);
-	}
-	if ((error = vnode_getwithref(vp)) == 0) {
-	        error = VNOP_WRITE(vp, auio, IO_UNIT | IO_APPEND, &context);
-		if (error == 0 && uio != NULL) {
-		        error = VNOP_WRITE(vp, uio, IO_UNIT | IO_APPEND, &context);
+	/* reset ownership if process cannot be found */
+
+	proc_t owning_proc = proc_find(ktrace_owning_pid);
+
+	if (owning_proc != NULL) {
+		/* make sure the pid was not recycled */
+		if (proc_uniqueid(owning_proc) != ktrace_owning_unique_id) {
+			ktrace_release_ownership();
 		}
-		vnode_put(vp);
+
+		proc_rele(owning_proc);
+	} else {
+		ktrace_release_ownership();
 	}
-	if (error) {
-	        /*
-		 * If error encountered, give up tracing on this vnode.
-		 */
-	        log(LOG_NOTICE, "ktrace write failed, errno %d, tracing stopped\n",
-		    error);
-		LIST_FOREACH(p, &allproc, p_list) {
-		        if (p->p_tracep == vp) {
-			        p->p_tracep = NULL;
-				p->p_traceflag = 0;
-				vnode_rele(vp);
+}
+
+int
+ktrace_configure(uint32_t config_mask)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+	assert(config_mask != 0);
+
+	proc_t p = current_proc();
+
+	/* if process clearly owns ktrace, allow */
+	if (proc_uniqueid(p) == ktrace_owning_unique_id) {
+		ktrace_active_mask |= config_mask;
+		return 0;
+	}
+
+	/* background configure while foreground is active is not allowed */
+	if (proc_uniqueid(p) == ktrace_bg_unique_id &&
+	    ktrace_state == KTRACE_STATE_FG)
+	{
+		return EBUSY;
+	}
+
+	ktrace_ownership_maintenance();
+
+	/* allow process to gain control when unowned or background */
+	if (ktrace_owning_unique_id == 0 || ktrace_state == KTRACE_STATE_BG) {
+		if (!kauth_cred_issuser(kauth_cred_get())) {
+			return EPERM;
+		}
+
+		ktrace_set_owning_proc(p);
+		ktrace_active_mask |= config_mask;
+		return 0;
+	}
+
+	/* owned by an existing, different process */
+	return EBUSY;
+}
+
+void
+ktrace_disable(enum ktrace_state state_to_match)
+{
+	if (ktrace_state == state_to_match) {
+		kernel_debug_disable();
+		kperf_sampling_disable();
+	}
+}
+
+int
+ktrace_get_owning_pid(void)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+
+	ktrace_ownership_maintenance();
+	return ktrace_owning_pid;
+}
+
+void
+ktrace_kernel_configure(uint32_t config_mask)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+
+	if (ktrace_state != KTRACE_STATE_OFF) {
+		if (ktrace_active_mask & KTRACE_KPERF) {
+			kperf_reset();
+		}
+		if (ktrace_active_mask & KTRACE_KDEBUG) {
+			kdebug_reset();
+		}
+	}
+
+	ktrace_active_mask = config_mask;
+	ktrace_state = KTRACE_STATE_FG;
+
+	ktrace_release_ownership();
+	strlcpy(ktrace_last_owner_execname, "kernel_task",
+		sizeof(ktrace_last_owner_execname));
+}
+
+static errno_t
+ktrace_init_background(void)
+{
+	int err = 0;
+
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+
+	if ((err = priv_check_cred(kauth_cred_get(), PRIV_KTRACE_BACKGROUND, 0))) {
+		return err;
+	}
+
+	/*
+	 * When a background tool first checks in, send a notification if ktrace
+	 * is available.
+	 */
+	if (should_notify_on_init) {
+		if (ktrace_state == KTRACE_STATE_OFF) {
+			/*
+			 * This notification can only fail if a process does not
+			 * hold the receive right for the host special port.
+			 * Return an error and don't make the current process
+			 * the background tool.
+			 */
+			if (ktrace_background_available_notify_user() == KERN_FAILURE) {
+				return EINVAL;
 			}
 		}
+		should_notify_on_init = FALSE;
+	}
+
+	proc_t p = current_proc();
+
+	ktrace_bg_unique_id = proc_uniqueid(p);
+	ktrace_bg_pid = proc_pid(p);
+
+	if (ktrace_state == KTRACE_STATE_BG) {
+		ktrace_set_owning_proc(p);
+	}
+
+	return 0;
+}
+
+void
+ktrace_set_invalid_owning_pid(void)
+{
+	if (ktrace_keep_ownership_on_reset) {
+		ktrace_reset(ktrace_active_mask);
+		ktrace_keep_ownership_on_reset = FALSE;
 	}
 }
 
-/*
- * Return true if caller has permission to set the ktracing state
- * of target.  Essentially, the target can't possess any
- * more permissions than the caller.  KTRFAC_ROOT signifies that
- * root previously set the tracing status on the target process, and
- * so, only root may further change it.
- *
- * TODO: check groups.  use caller effective gid.
- */
-static int
-ktrcanset(__unused struct proc *callp, struct proc *targetp)
+int
+ktrace_set_owning_pid(int pid)
 {
-	kauth_cred_t caller = kauth_cred_get();
-	kauth_cred_t target = targetp->p_ucred;		/* XXX */
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
 
-#if 0
-	/* PRISON_CHECK was defined to 1 always .... */
-	if (!PRISON_CHECK(callp, targetp))
-		return (0);
-#endif
-	if ((kauth_cred_getuid(caller) == target->cr_ruid &&
-	     target->cr_ruid == target->cr_svuid &&
-	     caller->cr_rgid == target->cr_rgid &&	/* XXX */
-	     target->cr_rgid == target->cr_svgid &&
-	     (targetp->p_traceflag & KTRFAC_ROOT) == 0 &&
-	     (targetp->p_flag & P_SUGID) == 0) ||
-	     !suser(caller, NULL))
-		return (1);
+	/* allow user space to successfully unset owning pid */
+	if (pid == -1) {
+		ktrace_set_invalid_owning_pid();
+		return 0;
+	}
 
-	return (0);
+	/* use ktrace_reset or ktrace_release_ownership, not this */
+	if (pid == 0) {
+		ktrace_set_invalid_owning_pid();
+		return EINVAL;
+	}
+
+	proc_t p = proc_find(pid);
+	if (!p) {
+		ktrace_set_invalid_owning_pid();
+		return ESRCH;
+	}
+
+	ktrace_keep_ownership_on_reset = TRUE;
+	ktrace_set_owning_proc(p);
+
+	proc_rele(p);
+	return 0;
 }
 
-#endif /* KTRACE */
+static void
+ktrace_set_owning_proc(proc_t p)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+	assert(p);
+
+	if (ktrace_state != KTRACE_STATE_FG) {
+		if (proc_uniqueid(p) == ktrace_bg_unique_id) {
+			ktrace_state = KTRACE_STATE_BG;
+		} else {
+			if (ktrace_state == KTRACE_STATE_BG) {
+				if (ktrace_active_mask & KTRACE_KPERF) {
+					kperf_reset();
+				}
+				if (ktrace_active_mask & KTRACE_KDEBUG) {
+					kdebug_reset();
+				}
+
+				ktrace_active_mask = 0;
+			}
+			ktrace_state = KTRACE_STATE_FG;
+			should_notify_on_init = FALSE;
+		}
+	}
+
+	ktrace_owning_unique_id = proc_uniqueid(p);
+	ktrace_owning_pid = proc_pid(p);
+	strlcpy(ktrace_last_owner_execname, proc_name_address(p),
+		sizeof(ktrace_last_owner_execname));
+}
+
+static void
+ktrace_release_ownership(void)
+{
+	lck_mtx_assert(ktrace_lock, LCK_MTX_ASSERT_OWNED);
+
+	ktrace_owning_unique_id = 0;
+	ktrace_owning_pid = 0;
+}
+
+#define SYSCTL_INIT_BACKGROUND (1)
+
+static int ktrace_sysctl SYSCTL_HANDLER_ARGS;
+
+SYSCTL_NODE(, OID_AUTO, ktrace, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "ktrace");
+
+SYSCTL_UINT(_ktrace, OID_AUTO, state, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &ktrace_state, 0,
+            "");
+
+SYSCTL_INT(_ktrace, OID_AUTO, owning_pid, CTLFLAG_RD | CTLFLAG_LOCKED,
+           &ktrace_owning_pid, 0,
+           "pid of the process that owns ktrace");
+
+SYSCTL_INT(_ktrace, OID_AUTO, background_pid, CTLFLAG_RD | CTLFLAG_LOCKED,
+           &ktrace_bg_pid, 0,
+           "pid of the background ktrace tool");
+
+SYSCTL_STRING(_ktrace, OID_AUTO, configured_by, CTLFLAG_RD | CTLFLAG_LOCKED,
+              ktrace_last_owner_execname, 0,
+              "execname of process that last configured ktrace");
+
+SYSCTL_PROC(_ktrace, OID_AUTO, init_background, CTLFLAG_RW | CTLFLAG_LOCKED,
+            (void *)SYSCTL_INIT_BACKGROUND, sizeof(int),
+            ktrace_sysctl, "I", "initialize calling process as background");
+
+static int
+ktrace_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg2)
+	int ret = 0;
+	uintptr_t type = (uintptr_t)arg1;
+
+	lck_mtx_lock(ktrace_lock);
+
+	if (!kauth_cred_issuser(kauth_cred_get())) {
+		ret = EPERM;
+		goto out;
+	}
+
+	if (type == SYSCTL_INIT_BACKGROUND) {
+		if (req->newptr != USER_ADDR_NULL) {
+			ret = ktrace_init_background();
+			goto out;
+		} else {
+			ret = EINVAL;
+			goto out;
+		}
+	} else {
+		ret = EINVAL;
+		goto out;
+	}
+
+out:
+	lck_mtx_unlock(ktrace_lock);
+	return ret;
+}
+
+/* This should only be called from the bootstrap thread. */
+void
+ktrace_init(void)
+{
+	static lck_grp_attr_t *lock_grp_attr = NULL;
+	static lck_grp_t *lock_grp = NULL;
+	static boolean_t initialized = FALSE;
+
+	if (initialized) {
+		return;
+	}
+
+	lock_grp_attr = lck_grp_attr_alloc_init();
+	lock_grp = lck_grp_alloc_init("ktrace", lock_grp_attr);
+	lck_grp_attr_free(lock_grp_attr);
+
+	ktrace_lock = lck_mtx_alloc_init(lock_grp, LCK_ATTR_NULL);
+	assert(ktrace_lock);
+	initialized = TRUE;
+}

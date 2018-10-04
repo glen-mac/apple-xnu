@@ -1,20 +1,15 @@
 /*
- * Copyright (c) 2000 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2016 Apple Inc. All rights reserved.
  *
- * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ * @APPLE_LICENSE_HEADER_START@
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
- * compliance with the License. The rights granted to you under the License
- * may not be used to create, or enable the creation or redistribution of,
- * unlawful or unlicensed copies of an Apple operating system, or to
- * circumvent, violate, or enable the circumvention or violation of, any
- * terms of an Apple operating system software license agreement.
- * 
- * Please obtain a copy of the License at
- * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ * compliance with the License. Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this
+ * file.
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,13 +17,13 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
- * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+ *
+ * @APPLE_LICENSE_HEADER_END@
  */
-/* Copyright (c) 1995 NeXT Computer, Inc. All Rights Reserved */
-/*
- * Copyright (c) 1992, 1993
- *	The Regents of the University of California.  All rights reserved.
+
+/*-
+ * Portions Copyright (c) 1992, 1993
+ *  The Regents of the University of California.  All rights reserved.
  *
  * This code is derived from software donated to Berkeley by
  * Jan-Simon Pendry.
@@ -41,10 +36,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the University of
- *	California, Berkeley and its contributors.
  * 4. Neither the name of the University nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
@@ -61,244 +52,354 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- *	@(#)null_subr.c	8.7 (Berkeley) 5/14/95
+ *  @(#)null_subr.c 8.7 (Berkeley) 5/14/95
  *
- *	null_subr.c	8.4 (Berkeley) 1/21/94
+ * $FreeBSD$
  */
-
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/proc.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/vnode.h>
-#include <sys/mount_internal.h>
-#include <sys/namei.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
-#include <sys/ubc.h>
-#include <miscfs/nullfs/null.h>
+#include <sys/mount.h>
+#include <sys/proc.h>
+#include <sys/vnode.h>
 
-#define LOG2_SIZEVNODE 7		/* log2(sizeof struct vnode) */
-#define	NNULLNODECACHE 16
+#include "nullfs.h"
 
 /*
  * Null layer cache:
  * Each cache entry holds a reference to the lower vnode
  * along with a pointer to the alias vnode.  When an
- * entry is added the lower vnode is vnode_get'd.  When the
- * alias is removed the lower vnode is vnode_put'd.
+ * entry is added the lower vnode is VREF'd.  When the
+ * alias is removed the lower vnode is vrele'd.
  */
 
-#define	NULL_NHASH(vp) \
-	(&null_node_hashtbl[(((uintptr_t)vp)>>LOG2_SIZEVNODE) & null_node_hash])
-LIST_HEAD(null_node_hashhead, null_node) *null_node_hashtbl;
-u_long null_node_hash;
+#define NULL_HASH_SIZE (desiredvnodes / 10)
+
+/* osx doesn't really have the functionality freebsd uses here..gonna try this
+ * hacked hash...*/
+#define NULL_NHASH(vp) (&null_node_hashtbl[((((uintptr_t)vp) >> vnsz2log) + (uintptr_t)vnode_mount(vp)) & null_hash_mask])
+
+static LIST_HEAD(null_node_hashhead, null_node) * null_node_hashtbl;
+static lck_mtx_t null_hashmtx;
+static lck_attr_t * null_hashlck_attr;
+static lck_grp_t * null_hashlck_grp;
+static lck_grp_attr_t * null_hashlck_grp_attr;
+static u_long null_hash_mask;
+
+/* os x doesn't have hashes built into vnode. gonna try doing what freebsd does
+ anyway
+ Don't want to create a dependency on vnode_internal.h and the real struct
+ vnode.
+ 9 is an eyeball of the log 2 size of vnode */
+static int vnsz2log = 9;
+
+static int null_hashins(struct mount *, struct null_node *, struct vnode **);
+
+int
+nullfs_init_lck(lck_mtx_t * lck)
+{
+	int error = 1;
+	if (lck && null_hashlck_grp && null_hashlck_attr) {
+		lck_mtx_init(lck, null_hashlck_grp, null_hashlck_attr);
+		error = 0;
+	}
+	return error;
+}
+
+int
+nullfs_destroy_lck(lck_mtx_t * lck)
+{
+	int error = 1;
+	if (lck && null_hashlck_grp) {
+		lck_mtx_destroy(lck, null_hashlck_grp);
+		error = 0;
+	}
+	return error;
+}
 
 /*
  * Initialise cache headers
  */
-nullfs_init()
+int
+nullfs_init(__unused struct vfsconf * vfsp)
 {
+	NULLFSDEBUG("%s\n", __FUNCTION__);
 
-#ifdef NULLFS_DIAGNOSTIC
-	printf("nullfs_init\n");		/* printed during system boot */
-#endif
-	null_node_hashtbl = hashinit(NNULLNODECACHE, M_CACHE, &null_node_hash);
+	/* assuming for now that this happens immediately and by default after fs
+	 * installation */
+	null_hashlck_grp_attr = lck_grp_attr_alloc_init();
+	if (null_hashlck_grp_attr == NULL) {
+		goto error;
+	}
+	null_hashlck_grp = lck_grp_alloc_init("com.apple.filesystems.nullfs", null_hashlck_grp_attr);
+	if (null_hashlck_grp == NULL) {
+		goto error;
+	}
+	null_hashlck_attr = lck_attr_alloc_init();
+	if (null_hashlck_attr == NULL) {
+		goto error;
+	}
+
+	lck_mtx_init(&null_hashmtx, null_hashlck_grp, null_hashlck_attr);
+	null_node_hashtbl = hashinit(NULL_HASH_SIZE, M_TEMP, &null_hash_mask);
+	NULLFSDEBUG("%s finished\n", __FUNCTION__);
+	return (0);
+error:
+	printf("NULLFS: failed to get lock element\n");
+	if (null_hashlck_grp_attr) {
+		lck_grp_attr_free(null_hashlck_grp_attr);
+		null_hashlck_grp_attr = NULL;
+	}
+	if (null_hashlck_grp) {
+		lck_grp_free(null_hashlck_grp);
+		null_hashlck_grp = NULL;
+	}
+	if (null_hashlck_attr) {
+		lck_attr_free(null_hashlck_attr);
+		null_hashlck_attr = NULL;
+	}
+	return KERN_FAILURE;
+}
+
+int
+nullfs_uninit()
+{
+	/* This gets called when the fs is uninstalled, there wasn't an exact
+	 * equivalent in vfsops */
+	lck_mtx_destroy(&null_hashmtx, null_hashlck_grp);
+	FREE(null_node_hashtbl, M_TEMP);
+	if (null_hashlck_grp_attr) {
+		lck_grp_attr_free(null_hashlck_grp_attr);
+		null_hashlck_grp_attr = NULL;
+	}
+	if (null_hashlck_grp) {
+		lck_grp_free(null_hashlck_grp);
+		null_hashlck_grp = NULL;
+	}
+	if (null_hashlck_attr) {
+		lck_attr_free(null_hashlck_attr);
+		null_hashlck_attr = NULL;
+	}
+	return (0);
 }
 
 /*
- * Return a vnode_get'ed alias for lower vnode if already exists, else 0.
+ * Find the nullfs vnode mapped to lowervp. Return it in *vpp with an iocount if found.
+ * Return 0 on success. On failure *vpp will be null and a non-zero error code will be returned.
  */
-static struct vnode *
-null_node_find(mp, lowervp)
-	struct mount *mp;
-	struct vnode *lowervp;
+int
+null_hashget(struct mount * mp, struct vnode * lowervp, struct vnode ** vpp)
 {
-	struct proc *p = curproc;	/* XXX */
-	struct null_node_hashhead *hd;
-	struct null_node *a;
-	struct vnode *vp;
+	struct null_node_hashhead * hd;
+	struct null_node * a;
+	struct vnode * vp;
+	int error = ENOENT;
 
 	/*
 	 * Find hash base, and then search the (two-way) linked
 	 * list looking for a null_node structure which is referencing
-	 * the lower vnode.  If found, the increment the null_node
-	 * reference count (but NOT the lower vnode's vnode_get counter).
+	 * the lower vnode. We only give up our reference at reclaim so
+	 * just check whether the lowervp has gotten pulled from under us
 	 */
 	hd = NULL_NHASH(lowervp);
-loop:
-	for (a = hd->lh_first; a != 0; a = a->null_hash.le_next) {
-		if (a->null_lowervp == lowervp && NULLTOV(a)->v_mount == mp) {
+	lck_mtx_lock(&null_hashmtx);
+	LIST_FOREACH(a, hd, null_hash)
+	{
+		if (a->null_lowervp == lowervp && vnode_mount(NULLTOV(a)) == mp) {
 			vp = NULLTOV(a);
-
-			if (vnode_get(vp)) {
-				printf ("null_node_find: vget failed.\n");
-				goto loop;
-			};
-			return (vp);
+			if (a->null_lowervid != vnode_vid(lowervp)) {
+				/*lowervp has reved */
+				error = EIO;
+			} else {
+				/* if we found something then get an iocount on it */
+				error = vnode_getwithvid(vp, a->null_myvid);
+				if (error == 0) {
+					*vpp = vp;
+				}
+			}
+			break;
 		}
 	}
-
-	return NULL;
+	lck_mtx_unlock(&null_hashmtx);
+	return error;
 }
 
-
 /*
- * Make a new null_node node.
- * Vp is the alias vnode, lofsvp is the lower vnode.
- * Maintain a reference to (lowervp).
+ * Act like null_hashget, but add passed null_node to hash if no existing
+ * node found.
  */
 static int
-null_node_alloc(mp, lowervp, vpp)
-	struct mount *mp;
-	struct vnode *lowervp;
-	struct vnode **vpp;
+null_hashins(struct mount * mp, struct null_node * xp, struct vnode ** vpp)
 {
-	struct null_node_hashhead *hd;
-	struct null_node *xp;
-	struct vnode *othervp, *vp;
-	int error;
+	struct null_node_hashhead * hd;
+	struct null_node * oxp;
+	struct vnode * ovp;
+	int error = 0;
 
-	MALLOC(xp, struct null_node *, sizeof(struct null_node), M_TEMP, M_WAITOK);
-	if (error = getnewvnode(VT_NULL, mp, null_vnodeop_p, vpp)) {
-		FREE(xp, M_TEMP);
-		return (error);
+	hd = NULL_NHASH(xp->null_lowervp);
+	lck_mtx_lock(&null_hashmtx);
+	LIST_FOREACH(oxp, hd, null_hash)
+	{
+		if (oxp->null_lowervp == xp->null_lowervp && vnode_mount(NULLTOV(oxp)) == mp) {
+			/*
+			 * See null_hashget for a description of this
+			 * operation.
+			 */
+			ovp = NULLTOV(oxp);
+			if (oxp->null_lowervid != vnode_vid(oxp->null_lowervp)) {
+				/*vp doesn't exist so return null (not sure we are actually gonna catch
+				 recycle right now
+				 This is an exceptional case right now, it suggests the vnode we are
+				 trying to add has been recycled
+				 don't add it.*/
+				error = EIO;
+				goto end;
+			}
+			/* if we found something in the hash map then grab an iocount */
+			error = vnode_getwithvid(ovp, oxp->null_myvid);
+			if (error == 0) {
+				*vpp = ovp;
+			}
+			goto end;
+		}
 	}
-	vp = *vpp;
-
-	vp->v_type = lowervp->v_type;
-	xp->null_vnode = vp;
-	vp->v_data = xp;
-	xp->null_lowervp = lowervp;
-	/*
-	 * Before we insert our new node onto the hash chains,
-	 * check to see if someone else has beaten us to it.
-	 */
-	if (othervp = null_node_find(lowervp)) {
-		FREE(xp, M_TEMP);
-		vp->v_type = VBAD;	/* node is discarded */
-		vp->v_usecount = 0;	/* XXX */
-		vp->v_data = 0; /* prevent access to freed data */
-		*vpp = othervp;
-		return 0;
-	};
-	if (vp->v_type == VREG)
-		ubc_info_init(vp);
-	vnode_get(lowervp);   /* Extra vnode_get will be vnode_put'd in null_node_create */
-	hd = NULL_NHASH(lowervp);
+	/* if it wasn't in the hash map then the vnode pointed to by xp already has a
+	 * iocount so don't bother */
 	LIST_INSERT_HEAD(hd, xp, null_hash);
-	return 0;
+	xp->null_flags |= NULL_FLAG_HASHED;
+end:
+	lck_mtx_unlock(&null_hashmtx);
+	return error;
 }
-
 
 /*
- * Try to find an existing null_node vnode refering
- * to it, otherwise make a new null_node vnode which
- * contains a reference to the lower vnode.
+ * Remove node from hash.
+ */
+void
+null_hashrem(struct null_node * xp)
+{
+	lck_mtx_lock(&null_hashmtx);
+	LIST_REMOVE(xp, null_hash);
+	lck_mtx_unlock(&null_hashmtx);
+}
+
+static struct null_node *
+null_nodecreate(struct vnode * lowervp)
+{
+	struct null_node * xp;
+
+	MALLOC(xp, struct null_node *, sizeof(struct null_node), M_TEMP, M_WAITOK | M_ZERO);
+	if (xp != NULL) {
+		if (lowervp) {
+			xp->null_lowervp  = lowervp;
+			xp->null_lowervid = vnode_vid(lowervp);
+		}
+	}
+	return xp;
+}
+
+/* assumption is that vnode has iocount on it after vnode create */
+int
+null_getnewvnode(
+    struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int root)
+{
+	struct vnode_fsparam vnfs_param;
+	int error             = 0;
+	enum vtype type       = VDIR;
+	struct null_node * xp = null_nodecreate(lowervp);
+
+	if (xp == NULL) {
+		return ENOMEM;
+	}
+
+	if (lowervp) {
+		type = vnode_vtype(lowervp);
+	}
+
+	vnfs_param.vnfs_mp         = mp;
+	vnfs_param.vnfs_vtype      = type;
+	vnfs_param.vnfs_str        = "nullfs";
+	vnfs_param.vnfs_dvp        = dvp;
+	vnfs_param.vnfs_fsnode     = (void *)xp;
+	vnfs_param.vnfs_vops       = nullfs_vnodeop_p;
+	vnfs_param.vnfs_markroot   = root;
+	vnfs_param.vnfs_marksystem = 0;
+	vnfs_param.vnfs_rdev       = 0;
+	vnfs_param.vnfs_filesize   = 0; // set this to 0 since we should only be shadowing non-regular files
+	vnfs_param.vnfs_cnp        = cnp;
+	vnfs_param.vnfs_flags      = VNFS_ADDFSREF;
+
+	error = vnode_create(VNCREATE_FLAVOR, VCREATESIZE, &vnfs_param, vpp);
+	if (error == 0) {
+		xp->null_vnode = *vpp;
+		xp->null_myvid = vnode_vid(*vpp);
+		vnode_settag(*vpp, VT_NULL);
+	} else {
+		FREE(xp, M_TEMP);
+	}
+	return error;
+}
+
+/*
+ * Make a new or get existing nullfs node.
+ * Vp is the alias vnode, lowervp is the lower vnode.
+ *
+ * lowervp is assumed to have an iocount on it from the caller
  */
 int
-null_node_create(mp, lowervp, newvpp)
-	struct mount *mp;
-	struct vnode *lowervp;
-	struct vnode **newvpp;
+null_nodeget(
+    struct mount * mp, struct vnode * lowervp, struct vnode * dvp, struct vnode ** vpp, struct componentname * cnp, int root)
 {
-	struct vnode *aliasvp;
+	struct vnode * vp;
+	int error;
 
-	if (aliasvp = null_node_find(mp, lowervp)) {
-		/*
-		 * null_node_find has taken another reference
-		 * to the alias vnode.
-		 */
-#ifdef NULLFS_DIAGNOSTIC
-		vprint("null_node_create: exists", NULLTOV(ap));
-#endif
-		/* vnode_get(aliasvp); --- done in null_node_find */
-	} else {
-		int error;
-
-		/*
-		 * Get new vnode.
-		 */
-#ifdef NULLFS_DIAGNOSTIC
-		printf("null_node_create: create new alias vnode\n");
-#endif
-
-		/*
-		 * Make new vnode reference the null_node.
-		 */
-		if (error = null_node_alloc(mp, lowervp, &aliasvp))
-			return error;
-
-		/*
-		 * aliasvp is already vnode_get'd by getnewvnode()
-		 */
+	/* Lookup the hash firstly. */
+	error = null_hashget(mp, lowervp, vpp);
+	/* ENOENT means it wasn't found, EIO is a failure we should bail from, 0 is it
+	 * was found */
+	if (error != ENOENT) {
+		/* null_hashget checked the vid, so if we got something here its legit to
+		 * the best of our knowledge*/
+		/* if we found something then there is an iocount on vpp,
+		   if we didn't find something then vpp shouldn't be used by the caller */
+		return error;
 	}
 
-	vnode_put(lowervp);
+	/*
+	 * We do not serialize vnode creation, instead we will check for
+	 * duplicates later, when adding new vnode to hash.
+	 */
+	error = vnode_ref(lowervp); // take a ref on lowervp so we let the system know we care about it
+	if(error)
+	{
+		// Failed to get a reference on the lower vp so bail. Lowervp may be gone already.
+		return error;
+	}
 
-#if DIAGNOSTIC
-	if (lowervp->v_usecount < 1) {
-		/* Should never happen... */
-		vprint ("null_node_create: alias ", aliasvp);
-		vprint ("null_node_create: lower ", lowervp);
-		panic ("null_node_create: lower has 0 usecount.");
-	};
-#endif
+	error = null_getnewvnode(mp, lowervp, dvp, &vp, cnp, root);
 
-#ifdef NULLFS_DIAGNOSTIC
-	vprint("null_node_create: alias", aliasvp);
-	vprint("null_node_create: lower", lowervp);
-#endif
+	if (error) {
+		vnode_rele(lowervp);
+		return (error);
+	}
 
-	*newvpp = aliasvp;
+	/*
+	 * Atomically insert our new node into the hash or vget existing
+	 * if someone else has beaten us to it.
+	 */
+	error = null_hashins(mp, VTONULL(vp), vpp);
+	if (error || *vpp != NULL) {
+		/* recycle will call reclaim which will get rid of the internals */
+		vnode_recycle(vp);
+		vnode_put(vp);
+		/* if we found vpp, then null_hashins put an iocount on it */
+		return error;
+	}
+
+	/* vp has an iocount from null_getnewvnode */
+	*vpp = vp;
+
 	return (0);
 }
-#ifdef NULLFS_DIAGNOSTIC
-struct vnode *
-null_checkvp(vp, fil, lno)
-	struct vnode *vp;
-	char *fil;
-	int lno;
-{
-	struct null_node *a = VTONULL(vp);
-#ifdef notyet
-	/*
-	 * Can't do this check because vnop_reclaim runs
-	 * with a funny vop vector.
-	 */
-	if (vp->v_op != null_vnodeop_p) {
-		printf ("null_checkvp: on non-null-node\n");
-		while (null_checkvp_barrier) /*WAIT*/ ;
-		panic("null_checkvp");
-	};
-#endif
-	if (a->null_lowervp == NULL) {
-		/* Should never happen */
-		int i; uint32_t *p;
-		printf("vp = %x, ZERO ptr\n", vp);
-		for (p = (uint32_t *) a, i = 0; i < 8; i++)
-			printf(" %x", p[i]);
-		printf("\n");
-		/* wait for debugger */
-		while (null_checkvp_barrier) /*WAIT*/ ;
-		panic("null_checkvp");
-	}
-	if (a->null_lowervp->v_usecount < 1) {
-		int i; uint32_t *p;
-		printf("vp = %x, unref'ed lowervp\n", vp);
-		for (p = (uint32_t *) a, i = 0; i < 8; i++)
-			printf(" %x", p[i]);
-		printf("\n");
-		/* wait for debugger */
-		while (null_checkvp_barrier) /*WAIT*/ ;
-		panic ("null with unref'ed lowervp");
-	};
-#ifdef notyet
-	printf("null %x/%d -> %x/%d [%s, %d]\n",
-	        NULLTOV(a), NULLTOV(a)->v_usecount,
-		a->null_lowervp, a->null_lowervp->v_usecount,
-		fil, lno);
-#endif
-	return a->null_lowervp;
-}
-#endif
