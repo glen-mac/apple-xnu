@@ -1,31 +1,29 @@
 /*
  * Copyright (c) 2001-2002 Apple Computer, Inc. All rights reserved.
  *
- * @APPLE_LICENSE_OSREFERENCE_HEADER_START@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
- * This file contains Original Code and/or Modifications of Original Code 
- * as defined in and that are subject to the Apple Public Source License 
- * Version 2.0 (the 'License'). You may not use this file except in 
- * compliance with the License.  The rights granted to you under the 
- * License may not be used to create, or enable the creation or 
- * redistribution of, unlawful or unlicensed copies of an Apple operating 
- * system, or to circumvent, violate, or enable the circumvention or 
- * violation of, any terms of an Apple operating system software license 
- * agreement.
- *
- * Please obtain a copy of the License at 
- * http://www.opensource.apple.com/apsl/ and read it before using this 
- * file.
- *
- * The Original Code and all software distributed under the License are 
- * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER 
- * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES, 
- * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, 
- * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT. 
- * Please see the License for the specific language governing rights and 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ * 
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
  * limitations under the License.
- *
- * @APPLE_LICENSE_OSREFERENCE_HEADER_END@
+ * 
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
  
 #include "IOPMWorkArbiter.h"
@@ -98,45 +96,6 @@ bool IOPMWorkArbiter::init(OSObject *owner, Action action)
     return true;
 }
 
-/*************************************************************************/
-bool IOPMWorkArbiter::driverAckedOccurred(IOService *inTarget)
-{
-    PMEventEntry                 *new_one = NULL;
-
-    new_one = (PMEventEntry *)IOMalloc(sizeof(PMEventEntry));
-    if(!new_one) return false;
-    
-    new_one->actionType = IOPMWorkArbiter::kDriverAcked;
-    new_one->target = inTarget;
-    
-    // Change to queue
-    IOLockLock(tmpLock);
-    _enqueue((void **)&events, (void *)new_one, 0);
-    IOLockUnlock(tmpLock);
-    signalWorkAvailable();
-
-    return true;
-}
-
-/*************************************************************************/
-bool IOPMWorkArbiter::allAckedOccurred(IOService *inTarget)  
-{
-    PMEventEntry                 *new_one = NULL;
-
-    new_one = (PMEventEntry *)IOMalloc(sizeof(PMEventEntry));
-    if(!new_one) return false;
-    
-    new_one->actionType = IOPMWorkArbiter::kAllAcked;
-    new_one->target = inTarget;
-    
-    // Change to queue
-    IOLockLock(tmpLock);
-    _enqueue((void **)&events, (void *)new_one, 0);
-    IOLockUnlock(tmpLock);
-    signalWorkAvailable();
-
-    return true;
-}
 
 /*************************************************************************/
 bool IOPMWorkArbiter::clamshellStateChangeOccurred(uint32_t messageValue)
@@ -149,6 +108,7 @@ bool IOPMWorkArbiter::clamshellStateChangeOccurred(uint32_t messageValue)
     new_one->actionType = IOPMWorkArbiter::kRootDomainClamshellChanged;
     new_one->target = (IOService *)fRootDomain;
     new_one->intArgument = messageValue;
+       new_one->target->retain();
     
     IOLockLock(tmpLock);
     _enqueue((void **)&events, (void *)new_one, 0);
@@ -156,33 +116,6 @@ bool IOPMWorkArbiter::clamshellStateChangeOccurred(uint32_t messageValue)
     signalWorkAvailable();
 
     return true;
-}
-
-
-/*************************************************************************/
-void IOPMWorkArbiter::checkForWorkThreadFunc(void *refcon)
-{
-    PMEventEntry                *theNode = (PMEventEntry *)refcon;    
-    IOService                   *theTarget;
-    UInt16                      theAction;
-
-    if(!theNode) return;
-    theTarget = theNode->target;
-    theAction = theNode->actionType;
-    IOFree(theNode, sizeof(PMEventEntry));
-    theNode = NULL;
-
-    switch (theAction)
-    {
-        case kAllAcked:
-            theTarget->all_acked_threaded();
-            break;
-
-        case kDriverAcked:
-            theTarget->driver_acked_threaded();
-            break;
-    }
-
 }
 
 
@@ -201,24 +134,19 @@ bool IOPMWorkArbiter::checkForWork()
       IOLockUnlock(tmpLock);
         theTarget = theNode->target;
         theAction = theNode->actionType;
-        IOFree((void *)theNode, sizeof(PMEventEntry));
 
         switch (theAction)
         {
-            case kAllAcked:
-                theTarget->all_acked_threaded();
-                break;
-
-            case kDriverAcked:
-                theTarget->driver_acked_threaded();
-                break;
-
             case kRootDomainClamshellChanged:
                 theTarget->messageClients(
                                 kIOPMMessageClamshellStateChange, 
                                 (void *)theNode->intArgument);
                 break;
         }
+
+               if (theTarget)
+                       theTarget->release();
+        IOFree((void *)theNode, sizeof(PMEventEntry));
     }
     else {
       IOLockUnlock(tmpLock);
@@ -229,87 +157,3 @@ bool IOPMWorkArbiter::checkForWork()
 }
 
 
-/*************************************************************************/
-
-/*************************************************************************/
-
-/*************************************************************************/
-
-/*************************************************************************/
-/*
-#undef super
-#define super OSObject
-
-PMWorkerThread *PMWorkerThread::workerThread( IOPMWorkArbiter *inArbiter )
-{
-    PMWorkerThread *     inst;
-
-    if( !(inst = new PMWorkerThread) )
-        goto exit;
-    
-    if( !inst->init() )
-        goto exit;
-        
-    inst->arbiter = inArbiter;
-
-    if( !(IOCreateThread((IOThreadFunc) &PMWorkerThread::main, inst)) )
-        goto exit;
-
-    return inst;
-
-exit:
-    if(inst)
-        inst->release();
-
-    return NULL;
-}
-
-void PMWorkerThread::free( void )
-{
-    super::free();
-}
-
-void PMWorkerThread::main( PMWorkerThread * self )
-{
-    PMWorkUnit    *job;
-    IOService     *who;
-
-    do {
-        // Get a new job 
-        
-        IOTakeLock( gJobsLock );
-
-        if( !(job = (PMWorkUnit *) gJobs->copyNextJob()) )
-        {
-            IOUnlock( gJobsLock );
-            semaphore_wait( gJobsSemaphore );
-            IOTakeLock( gJobsLock );
-            
-            job = (PMWorkUnit *) gJobs->copyNextJob();
-        }
-
-        IOUnlock( gJobsLock );
-
-        if(job) 
-        {
-            who = job->who;
-    
-            // Do job 
-            switch(job->type) 
-            {
-                case kMatchNubJob:
-                    if(who)
-                        who->doServiceMatch();
-                    break;
-
-                default:
-                    break;
-            }
-        }
-
-    } while( alive );
-
-    self->release();
-}
-
-*/

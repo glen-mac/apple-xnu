@@ -1,31 +1,29 @@
 /*
  * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
  *
- * @APPLE_LICENSE_OSREFERENCE_HEADER_START@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
- * This file contains Original Code and/or Modifications of Original Code 
- * as defined in and that are subject to the Apple Public Source License 
- * Version 2.0 (the 'License'). You may not use this file except in 
- * compliance with the License.  The rights granted to you under the 
- * License may not be used to create, or enable the creation or 
- * redistribution of, unlawful or unlicensed copies of an Apple operating 
- * system, or to circumvent, violate, or enable the circumvention or 
- * violation of, any terms of an Apple operating system software license 
- * agreement.
- *
- * Please obtain a copy of the License at 
- * http://www.opensource.apple.com/apsl/ and read it before using this 
- * file.
- *
- * The Original Code and all software distributed under the License are 
- * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER 
- * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES, 
- * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, 
- * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT. 
- * Please see the License for the specific language governing rights and 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ * 
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
  * limitations under the License.
- *
- * @APPLE_LICENSE_OSREFERENCE_HEADER_END@
+ * 
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
 #include <string.h>
@@ -191,7 +189,19 @@ extern void dump_ldt(void *);
 extern void dump_idt(void *);
 extern void dump_tss(void *);
 extern void dump_frame32(x86_saved_state_compat32_t *scp);
-extern void dump_frame64(x86_saved_state64_t *scp);
+extern void dump_frame64(x86_saved_state64_t *sp);
+extern void dump_frame(x86_saved_state_t *sp);
+
+void
+dump_frame(x86_saved_state_t *sp)
+{
+	if (is_saved_state32(sp))
+		dump_frame32((x86_saved_state_compat32_t *) sp);
+	else if (is_saved_state64(sp))
+		dump_frame64(&sp->ss_64);
+	else
+		kprintf("dump_frame(%p) unknown type %d\n", sp, sp->flavor);
+}
 
 void
 dump_frame32(x86_saved_state_compat32_t *scp)
@@ -237,48 +247,48 @@ dump_frame32(x86_saved_state_compat32_t *scp)
 }
 
 void
-dump_frame64(x86_saved_state64_t *scp)
+dump_frame64(x86_saved_state64_t *sp)
 {
 	unsigned int	i;
-	uint64_t	*ip = (uint64_t *) scp;
+	uint64_t	*ip = (uint64_t *) sp;
 
-	kprintf("dump_frame64(0x%08x):\n", scp);
+	kprintf("dump_frame64(%p):\n", sp);
 	
 	for (i = 0;
 	     i < sizeof(x86_saved_state64_t)/sizeof(uint64_t);
 	     i++, ip++)
 		kprintf("0x%08x: 0x%016x\n", ip, *ip);
 
-	kprintf("scp->isf.trapno: 0x%08x\n", scp->isf.trapno);
-	kprintf("scp->isf.trapfn: 0x%08x\n", scp->isf.trapfn);
-	kprintf("scp->isf.err:    0x%016llx\n", scp->isf.err);
-	kprintf("scp->isf.rip:    0x%016llx\n", scp->isf.rip);
-	kprintf("scp->isf.cs:     0x%016llx\n", scp->isf.cs);
-	kprintf("scp->isf.rflags: 0x%016llx\n", scp->isf.rflags);
-	kprintf("scp->isf.rsp:    0x%016llx\n", scp->isf.rsp);
-	kprintf("scp->isf.ss:     0x%016llx\n", scp->isf.ss);
+	kprintf("sp->isf.trapno: 0x%08x\n", sp->isf.trapno);
+	kprintf("sp->isf.trapfn: 0x%08x\n", sp->isf.trapfn);
+	kprintf("sp->isf.err:    0x%016llx\n", sp->isf.err);
+	kprintf("sp->isf.rip:    0x%016llx\n", sp->isf.rip);
+	kprintf("sp->isf.cs:     0x%016llx\n", sp->isf.cs);
+	kprintf("sp->isf.rflags: 0x%016llx\n", sp->isf.rflags);
+	kprintf("sp->isf.rsp:    0x%016llx\n", sp->isf.rsp);
+	kprintf("sp->isf.ss:     0x%016llx\n", sp->isf.ss);
 
-	kprintf("scp->fs:         0x%016llx\n", scp->fs);
-	kprintf("scp->gs:         0x%016llx\n", scp->gs);
-	kprintf("scp->rax:        0x%016llx\n", scp->rax);
-	kprintf("scp->rcx:        0x%016llx\n", scp->rcx);
-	kprintf("scp->rbx:        0x%016llx\n", scp->rbx);
-	kprintf("scp->rbp:        0x%016llx\n", scp->rbp);
-	kprintf("scp->r11:        0x%016llx\n", scp->r11);
-	kprintf("scp->r12:        0x%016llx\n", scp->r12);
-	kprintf("scp->r13:        0x%016llx\n", scp->r13);
-	kprintf("scp->r14:        0x%016llx\n", scp->r14);
-	kprintf("scp->r15:        0x%016llx\n", scp->r15);
-	kprintf("scp->cr2:        0x%016llx\n", scp->cr2);
-	kprintf("scp->v_arg8:     0x%016llx\n", scp->v_arg8);
-	kprintf("scp->v_arg7:     0x%016llx\n", scp->v_arg7);
-	kprintf("scp->v_arg6:     0x%016llx\n", scp->v_arg6);
-	kprintf("scp->r9:         0x%016llx\n", scp->r9);
-	kprintf("scp->r8:         0x%016llx\n", scp->r8);
-	kprintf("scp->r10:        0x%016llx\n", scp->r10);
-	kprintf("scp->rdx:        0x%016llx\n", scp->rdx);
-	kprintf("scp->rsi:        0x%016llx\n", scp->rsi);
-	kprintf("scp->rdi:        0x%016llx\n", scp->rdi);
+	kprintf("sp->fs:         0x%016x\n", sp->fs);
+	kprintf("sp->gs:         0x%016x\n", sp->gs);
+	kprintf("sp->rax:        0x%016llx\n", sp->rax);
+	kprintf("sp->rcx:        0x%016llx\n", sp->rcx);
+	kprintf("sp->rbx:        0x%016llx\n", sp->rbx);
+	kprintf("sp->rbp:        0x%016llx\n", sp->rbp);
+	kprintf("sp->r11:        0x%016llx\n", sp->r11);
+	kprintf("sp->r12:        0x%016llx\n", sp->r12);
+	kprintf("sp->r13:        0x%016llx\n", sp->r13);
+	kprintf("sp->r14:        0x%016llx\n", sp->r14);
+	kprintf("sp->r15:        0x%016llx\n", sp->r15);
+	kprintf("sp->cr2:        0x%016llx\n", sp->cr2);
+	kprintf("sp->v_arg8:     0x%016llx\n", sp->v_arg8);
+	kprintf("sp->v_arg7:     0x%016llx\n", sp->v_arg7);
+	kprintf("sp->v_arg6:     0x%016llx\n", sp->v_arg6);
+	kprintf("sp->r9:         0x%016llx\n", sp->r9);
+	kprintf("sp->r8:         0x%016llx\n", sp->r8);
+	kprintf("sp->r10:        0x%016llx\n", sp->r10);
+	kprintf("sp->rdx:        0x%016llx\n", sp->rdx);
+	kprintf("sp->rsi:        0x%016llx\n", sp->rsi);
+	kprintf("sp->rdi:        0x%016llx\n", sp->rdi);
 
 	postcode(0x98);
 }

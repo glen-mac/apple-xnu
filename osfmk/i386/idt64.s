@@ -1,31 +1,29 @@
 /*
  * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
  *
- * @APPLE_LICENSE_OSREFERENCE_HEADER_START@
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  * 
- * This file contains Original Code and/or Modifications of Original Code 
- * as defined in and that are subject to the Apple Public Source License 
- * Version 2.0 (the 'License'). You may not use this file except in 
- * compliance with the License.  The rights granted to you under the 
- * License may not be used to create, or enable the creation or 
- * redistribution of, unlawful or unlicensed copies of an Apple operating 
- * system, or to circumvent, violate, or enable the circumvention or 
- * violation of, any terms of an Apple operating system software license 
- * agreement.
- *
- * Please obtain a copy of the License at 
- * http://www.opensource.apple.com/apsl/ and read it before using this 
- * file.
- *
- * The Original Code and all software distributed under the License are 
- * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER 
- * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES, 
- * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, 
- * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT. 
- * Please see the License for the specific language governing rights and 
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ * 
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ * 
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
  * limitations under the License.
- *
- * @APPLE_LICENSE_OSREFERENCE_HEADER_END@
+ * 
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 #include <i386/asm.h>
 #include <i386/asm64.h>
@@ -173,7 +171,7 @@ EXCEP64_SPC(0x0b,hi64_segnp)
 #if	MACH_KDB
 EXCEP64_IST(0x0c,db_task_stk_fault64,1)
 #else
-EXCEP64_IST(0x0c,hi64_stack_fault,1)
+EXCEP64_SPC(0x0c,hi64_stack_fault)
 #endif
 EXCEP64_SPC(0x0d,hi64_gen_prot)
 EXCEP64_ERR(0x0e,t64_page_fault)
@@ -1053,6 +1051,10 @@ Entry(hi64_gen_prot)
 	push	$(T_GENERAL_PROTECTION)
 	jmp	trap_check_kernel_exit	/* check for kernel exit sequence */
 
+Entry(hi64_stack_fault)
+	push	$(T_STACK_FAULT)
+	jmp	trap_check_kernel_exit	/* check for kernel exit sequence */
+
 Entry(hi64_segnp)
 	push	$(T_SEGMENT_NOT_PRESENT)
 					/* indicate fault type */
@@ -1066,7 +1068,7 @@ trap_check_kernel_exit:
 	jne	hi64_take_trap		/* trap not in uber-space */
 
 	cmpl	$(EXT(ret32_iret)), 16(%rsp)
-	je	L_fault_iret
+	je	L_fault_iret32
 	cmpl	$(EXT(ret32_set_ds)), 16(%rsp)
 	je	L_32bit_fault_set_seg
 	cmpl	$(EXT(ret32_set_es)), 16(%rsp)
@@ -1077,7 +1079,7 @@ trap_check_kernel_exit:
 	je	L_32bit_fault_set_seg
 
 	cmpl	$(EXT(ret64_iret)), 16(%rsp)
-	je	L_fault_iret
+	je	L_fault_iret64
 
 hi64_take_trap:
 	jmp	L_enter_lohandler
@@ -1093,33 +1095,47 @@ hi64_take_trap:
  *  16	rip
  *  24	cs
  *  32	rflags
- *  40	rsp		--> new trapno
- *  48	ss		--> new errcode
- *  56	user rip
- *  64	user cs
- *  72	user rflags
- *  80	user rsp
- *  88  user ss
+ *  40	rsp
+ *  48	ss			--> new trapno/trapfn
+ *  56  (16-byte padding)	--> new errcode
+ *  64	user rip
+ *  72	user cs
+ *  80	user rflags
+ *  88	user rsp
+ *  96  user ss
  */
-L_fault_iret:
+L_fault_iret32:
 	mov	%rax, 16(%rsp)		/* save rax (we don`t need saved rip) */
-	pop	%rax			/* get trap number */
-	mov	%rax, 40-8(%rsp)	/* put in user trap number */
-	pop	%rax			/* get error code */
-	mov	%rax, 48-8-8(%rsp)	/* put in user errcode */
-	pop	%rax			/* restore rax */
-	add	$16,%rsp		/* eat 2 more slots */
+	mov	0(%rsp), %rax		/* get trap number */
+	mov	%rax, 48(%rsp)		/* put in user trap number */
+	mov	8(%rsp), %rax		/* get error code */
+	mov	%rax, 56(%rsp)		/* put in user errcode */
+	mov	16(%rsp), %rax		/* restore rax */
+	add	$48, %rsp		/* reset to original frame */
 					/* now treat as fault from user */
-	jmp	L_enter_lohandler
+	swapgs
+	jmp	L_32bit_enter
+
+L_fault_iret64:
+	mov	%rax, 16(%rsp)		/* save rax (we don`t need saved rip) */
+	mov	0(%rsp), %rax		/* get trap number */
+	mov	%rax, 48(%rsp)		/* put in user trap number */
+	mov	8(%rsp), %rax		/* get error code */
+	mov	%rax, 56(%rsp)		/* put in user errcode */
+	mov	16(%rsp), %rax		/* restore rax */
+	add	$48, %rsp		/* reset to original frame */
+					/* now treat as fault from user */
+	swapgs
+	jmp	L_64bit_enter
 
 /*
  * Fault restoring a segment register.  All of the saved state is still
- * on the stack untouched since we haven't yet moved the stack pointer.
+ * on the stack untouched since we didn't move the stack pointer.
  */
 L_32bit_fault_set_seg:
-	pop	%rax			/* get trap number/function */
-	pop	%rdx			/* get error code */
-	add	$40,%rsp		/* pop stack to saved state */
+	mov	0(%rsp), %rax		/* get trap number/function */
+	mov	8(%rsp), %rdx		/* get error code */
+	mov	40(%rsp), %rsp		/* reload stack prior to fault */
 	mov	%rax,ISC32_TRAPNO(%rsp)
 	mov	%rdx,ISC32_ERR(%rsp)
 					/* now treat as fault from user */
@@ -1140,7 +1156,6 @@ Entry(db_task_dbl_fault64)
 	jmp	L_enter_lohandler	
 
 Entry(db_task_stk_fault64)
-Entry(hi64_stack_fault)
 	push	$(T_STACK_FAULT)
 	movl	$(LO_DOUBLE_FAULT), ISF64_TRAPFN(%rsp)
 	jmp	L_enter_lohandler	
