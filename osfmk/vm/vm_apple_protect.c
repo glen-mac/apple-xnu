@@ -1,23 +1,31 @@
 /*
  * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
  *
- * @APPLE_LICENSE_HEADER_START@
+ * @APPLE_LICENSE_OSREFERENCE_HEADER_START@
  * 
- * The contents of this file constitute Original Code as defined in and
- * are subject to the Apple Public Source License Version 1.1 (the
- * "License").  You may not use this file except in compliance with the
- * License.  Please obtain a copy of the License at
- * http://www.apple.com/publicsource and read it before using this file.
- * 
- * This Original Code and all software distributed under the License are
- * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
- * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
- * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
- * License for the specific language governing rights and limitations
- * under the License.
- * 
- * @APPLE_LICENSE_HEADER_END@
+ * This file contains Original Code and/or Modifications of Original Code 
+ * as defined in and that are subject to the Apple Public Source License 
+ * Version 2.0 (the 'License'). You may not use this file except in 
+ * compliance with the License.  The rights granted to you under the 
+ * License may not be used to create, or enable the creation or 
+ * redistribution of, unlawful or unlicensed copies of an Apple operating 
+ * system, or to circumvent, violate, or enable the circumvention or 
+ * violation of, any terms of an Apple operating system software license 
+ * agreement.
+ *
+ * Please obtain a copy of the License at 
+ * http://www.opensource.apple.com/apsl/ and read it before using this 
+ * file.
+ *
+ * The Original Code and all software distributed under the License are 
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER 
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES, 
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY, 
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT. 
+ * Please see the License for the specific language governing rights and 
+ * limitations under the License.
+ *
+ * @APPLE_LICENSE_OSREFERENCE_HEADER_END@
  */
 
 #include <sys/errno.h>
@@ -345,12 +353,35 @@ apple_protect_pager_data_request(
 			  VM_INHERIT_NONE);
 	switch (kr) {
 	case KERN_SUCCESS:
+		/* wire the memory to make sure it is available */
+		kr = vm_map_wire(kernel_map,
+				 src_mapping,
+				 src_mapping + length,
+				 VM_PROT_READ,
+				 FALSE);
+		if (kr != KERN_SUCCESS) {
+			/*
+			 * Wiring failed, so unmap source and fall back
+			 * to page by page mapping of the source.
+			 */
+			kr = vm_map_remove(kernel_map,
+					   src_mapping,
+					   src_mapping + length,
+					   VM_MAP_NO_FLAGS);
+			assert(kr == KERN_SUCCESS);
+			src_mapping = 0;
+			src_vaddr = 0;
+			src_map_page_by_page = TRUE;
+			break;
+		}
+		/* source region is now fully mapped and wired */
 		src_map_page_by_page = FALSE;
 		src_vaddr = CAST_DOWN(vm_offset_t, src_mapping);
 		break;
 	case KERN_NO_SPACE:
-		/* we can't map the entire section, so map it page by page */
+		/* we couldn't map the entire source, so map it page by page */
 		src_map_page_by_page = TRUE;
+		/* release the reference for the failed mapping */
 		vm_object_deallocate(src_object);
 		break;
 	default:
@@ -411,23 +442,10 @@ apple_protect_pager_data_request(
 	for (cur_offset = 0; cur_offset < length; cur_offset += PAGE_SIZE) {
 		ppnum_t dst_pnum;
 
-		/*
-		 * Establish an explicit pmap mapping of the destination
-		 * physical page.
-		 * We can't do a regular VM mapping because the VM page
-		 * is "busy".
-		 */
 		if (!upl_page_present(upl_pl, cur_offset / PAGE_SIZE)) {
 			/* this page is not in the UPL: skip it */
 			continue;
 		}
-		dst_pnum = (addr64_t)
-			upl_phys_page(upl_pl, cur_offset / PAGE_SIZE);
-		assert (dst_pnum != 0);
-		pmap_enter(kernel_pmap, dst_mapping, dst_pnum,
-			   VM_PROT_READ | VM_PROT_WRITE,
-			   dst_object->wimg_bits & VM_WIMG_MASK,
-			   FALSE);
 
 		/*
 		 * Map the source (encrypted) page in the kernel's
@@ -451,10 +469,46 @@ apple_protect_pager_data_request(
 				retval = kr;
 				goto done;
 			}
+			kr = vm_map_wire(kernel_map,
+					 src_mapping,
+					 src_mapping + PAGE_SIZE_64,
+					 VM_PROT_READ,
+					 FALSE);
+			if (kr != KERN_SUCCESS) {
+				retval = kr;
+				kr = vm_map_remove(kernel_map,
+						   src_mapping,
+						   src_mapping + PAGE_SIZE_64,
+						   VM_MAP_NO_FLAGS);
+				assert(kr == KERN_SUCCESS);
+				src_mapping = 0;
+				src_vaddr = 0;
+				printf("apple_protect_pager_data_request: "
+				       "failed to resolve page fault for src "
+				       "object %p offset 0x%llx "
+				       "preempt %d error 0x%x\n",
+				       src_object, offset + cur_offset,
+				       get_preemption_level(), retval);
+				goto done;
+			}
 			src_vaddr = CAST_DOWN(vm_offset_t, src_mapping);
 		} else {
 			src_vaddr = src_mapping + cur_offset;
 		}
+
+		/*
+		 * Establish an explicit pmap mapping of the destination
+		 * physical page.
+		 * We can't do a regular VM mapping because the VM page
+		 * is "busy".
+		 */
+		dst_pnum = (addr64_t)
+			upl_phys_page(upl_pl, cur_offset / PAGE_SIZE);
+		assert(dst_pnum != 0);
+		pmap_enter(kernel_pmap, dst_mapping, dst_pnum,
+			   VM_PROT_READ | VM_PROT_WRITE,
+			   dst_object->wimg_bits & VM_WIMG_MASK,
+			   FALSE);
 
 		/*
 		 * Decrypt the encrypted contents of the source page
@@ -470,30 +524,32 @@ apple_protect_pager_data_request(
 		pmap_remove(kernel_pmap,
 			    (addr64_t) dst_mapping,
 			    (addr64_t) (dst_mapping + PAGE_SIZE_64));
+
 		if (src_map_page_by_page) {
 			/*
-			 * Remove the kernel mapping of the source page.
+			 * Remove the wired kernel mapping of the source page.
 			 * This releases the extra reference we took on
 			 * src_object.
 			 */
 			kr = vm_map_remove(kernel_map,
 					   src_mapping,
 					   src_mapping + PAGE_SIZE_64,
-					   VM_MAP_NO_FLAGS);
+					   VM_MAP_REMOVE_KUNWIRE);
 			assert(kr == KERN_SUCCESS);
 			src_mapping = 0;
+			src_vaddr = 0;
 		}
 	}
 
 	retval = KERN_SUCCESS;
 done:
 	if (src_mapping != 0) {
-		/* clean up the mapping of the source pages */
+		/* remove the wired mapping of the source pages */
 		kr = vm_map_remove(kernel_map,
 				   src_mapping,
 				   src_mapping + length,
-				   VM_MAP_NO_FLAGS);
-		assert (kr == KERN_SUCCESS);
+				   VM_MAP_REMOVE_KUNWIRE);
+		assert(kr == KERN_SUCCESS);
 		src_mapping = 0;
 		src_vaddr = 0;
 	}
