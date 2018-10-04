@@ -42,12 +42,12 @@
 #include <vm/vm_page.h>
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
+#include <i386/cpuid.h>
+#include <i386/machine_cpu.h>
+#include <i386/mp.h>
+#include <i386/machine_routines.h>
 #include <i386/pmap.h>
 #include <i386/misc_protos.h>
-#include <i386/cpuid.h>
-#include <i386/mp.h>
-#include <i386/machine_cpu.h>
-#include <i386/machine_routines.h>
 #include <i386/io_map_entries.h>
 #include <architecture/i386/pio.h>
 #include <i386/cpuid.h>
@@ -59,9 +59,7 @@
 #include <i386/cpu_threads.h>
 #include <pexpert/device_tree.h>
 #if	MACH_KDB
-#include <i386/db_machdep.h>
-#endif
-#if	MACH_KDB
+#include <machine/db_machdep.h>
 #include <ddb/db_aout.h>
 #include <ddb/db_access.h>
 #include <ddb/db_sym.h>
@@ -70,7 +68,6 @@
 #include <ddb/db_output.h>
 #include <ddb/db_expr.h>
 #endif /* MACH_KDB */
-#include <ddb/tr.h>
 
 /* Decimal powers: */
 #define kilo (1000ULL)
@@ -79,7 +76,7 @@
 #define Tera (kilo * Giga)
 #define Peta (kilo * Tera)
 
-uint32_t hpetArea = 0;			
+vm_offset_t hpetArea = 0;			
 uint32_t hpetAreap = 0;			
 uint64_t hpetFemto = 0;
 uint64_t hpetFreq = 0;
@@ -91,7 +88,7 @@ uint64_t hpet2tsc = 0;
 uint64_t bus2hpet = 0;
 uint64_t hpet2bus = 0;
 
-uint32_t rcbaArea = 0;			
+vm_offset_t rcbaArea = 0;			
 uint32_t rcbaAreap = 0;			
 
 static int (*hpet_req)(uint32_t apicid, void *arg, hpetRequest_t *hpet) = NULL;
@@ -208,7 +205,7 @@ map_rcbaArea(void)
 	outl(cfgAdr, lpcCfg | (0xF0 & 0xFC));
 	rcbaAreap = inl(cfgDat | (0xF0 & 0x03));
 	rcbaArea = io_map_spec(rcbaAreap & -4096, PAGE_SIZE * 4, VM_WIMG_IO);
-	kprintf("RCBA: vaddr = %08X, paddr = %08X\n", rcbaArea, rcbaAreap);
+	kprintf("RCBA: vaddr = %lX, paddr = %08X\n", (unsigned long)rcbaArea, rcbaAreap);
 }
 
 /*
@@ -239,7 +236,7 @@ hpet_init(void)
 	 */
 	hpetAreap = hpetAddr | ((hptc & 3) << 12);
 	hpetArea = io_map_spec(hpetAreap & -4096, PAGE_SIZE * 4, VM_WIMG_IO);
-	kprintf("HPET: vaddr = %08X, paddr = %08X\n", hpetArea, hpetAreap);
+	kprintf("HPET: vaddr = %lX, paddr = %08X\n", (unsigned long)hpetArea, hpetAreap);
 
 	/*
 	 * Extract the HPET tick rate.
@@ -363,7 +360,7 @@ ml_hpet_cfg(uint32_t cpu, uint32_t hpetVect)
 	enabled = ml_set_interrupts_enabled(FALSE);
 
 	/* Calculate address of the HPET for this processor */
-	hpetVaddr = (uint64_t *)(((uint32_t)&(((hpetReg_t *)hpetArea)->TIM1_CONF)) + (cpu << 5));
+	hpetVaddr = (uint64_t *)(((uintptr_t)&(((hpetReg_t *)hpetArea)->TIM1_CONF)) + (cpu << 5));
 	hpet = (hpetTimer_t *)hpetVaddr;
 
 	DBG("ml_hpet_cfg: HPET for cpu %d at %p, vector = %d\n",
