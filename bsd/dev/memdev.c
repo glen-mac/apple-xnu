@@ -61,7 +61,7 @@
 #include <sys/vnode.h>
 #include <sys/fcntl.h>
 #include <sys/conf.h>
-#include <dev/disk.h>
+#include <sys/disk.h>
 #include <sys/stat.h>
 
 #include <sys/vm.h>
@@ -227,7 +227,7 @@ static void mdevstrategy(struct buf *bp) {
 		if((bp->b_flags & B_NEED_IODONE) &&				/* If we have a UPL, is it already mapped? */
 		  tbuf && 
 		  tbuf->b_data) {
-			vaddr = tbuf->b_data;						/* We already have this mapped in, get base address */
+			vaddr = (vm_offset_t)tbuf->b_data;						/* We already have this mapped in, get base address */
 		}
 		else {											/* Not mapped yet */										
 			ret = ubc_upl_map(bp->b_pagelist, &vaddr);	/* Map it in */
@@ -236,13 +236,14 @@ static void mdevstrategy(struct buf *bp) {
 		}
 		vaddr = vaddr += bp->b_uploffset;				/* Calculate actual vaddr */
 	}
-	else vaddr = bp->b_data;							/* No UPL, we already have address */
+	else vaddr = (vm_offset_t)bp->b_data;							/* No UPL, we already have address */
 	
 	fvaddr = (mdev[devid].mdBase << 12) + blkoff;		/* Point to offset into ram disk */
 	
 	if(bp->b_flags & B_READ) {							/* Is this a read? */
 		if(!(mdev[devid].mdFlags & mdPhys)) {			/* Physical mapped disk? */
-			bcopy((void *)fvaddr, (void *)vaddr, bp->b_bcount);	/* This is virtual, just get the data */
+			bcopy((void *)((uintptr_t)fvaddr),
+				(void *)vaddr, (size_t)bp->b_bcount);	/* This is virtual, just get the data */
 		}
 		else {
 			left = bp->b_bcount;						/* Init the amount left to copy */
@@ -267,7 +268,8 @@ static void mdevstrategy(struct buf *bp) {
 	}
 	else {												/* This is a write */
 		if(!(mdev[devid].mdFlags & mdPhys)) {			/* Physical mapped disk? */
-			bcopy((void *)vaddr, (void *)fvaddr, bp->b_bcount);	/* This is virtual, just put the data */
+			bcopy((void *)vaddr, (void *)((uintptr_t)fvaddr),
+				(size_t)bp->b_bcount);	/* This is virtual, just put the data */
 		}
 		else {
 			left = bp->b_bcount;						/* Init the amount left to copy */
@@ -363,7 +365,7 @@ static int mdevioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc 
 			*f = ((mdev[devid].mdSize << 12) + mdev[devid].mdSecsize - 1) / mdev[devid].mdSecsize;
 			break;
 			
-		case DKIOCGETBLOCKCOUNT64:
+		case DKIOCGETBLOCKCOUNT:
 			if(!(mdev[devid].mdFlags & mdInited)) return (ENXIO);
 			*o = ((mdev[devid].mdSize << 12) + mdev[devid].mdSecsize - 1) / mdev[devid].mdSecsize;
 			break;
@@ -388,6 +390,7 @@ static	int mdevsize(dev_t dev) {
 	return(mdev[devid].mdSecsize);
 }
 
+#include <pexpert/pexpert.h>
 
 void mdevinit(int cnt) {
 

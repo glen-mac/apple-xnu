@@ -288,7 +288,7 @@ LFwdAligned:
         beq		LFwdMedAligned		// source is 8-byte aligned, so use ld/std loop
         mfspr	rv,vrsave			// get bitmap of live vector registers
         oris	w4,rv,0xFFF8		// we use v0-v12
-        li		c16,16				// get constants used in lvx
+        li		c16,16				// get constant used in lvx
         li		c32,32
         mtspr	vrsave,w4			// update mask
         lvx		v1,0,rs				// prefetch 1st source quadword

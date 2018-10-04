@@ -58,7 +58,8 @@ typedef struct lowglo {
 	unsigned char	lgVerCode[8];			/* 5000 System verification code */
 	unsigned long long lgZero;				/* 5008 Double constant 0 */
 	unsigned int	lgPPStart;				/* 5010 Start of per_proc blocks */
-	unsigned int	lgRsv014[27];			/* 5014 reserved */
+	unsigned int    lgCHUDXNUfnStart;		/* 5014 CHUD XNU function glue table */
+	unsigned int	lgRsv018[26];			/* 5018 reserved */
 	traceWork		lgTrcWork;				/* 5080 Tracing control block - trcWork */
 	unsigned int	lgRsv0A0[24];			/* 50A0 reserved */
 	struct Saveanchor	lgSaveanchor;		/* 5100 Savearea anchor - saveanchor */

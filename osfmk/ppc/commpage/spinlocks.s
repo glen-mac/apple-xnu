@@ -59,11 +59,13 @@
 
 
 spinlock_32_try_mp:
+	mr	r5, r3
+	li	r3, 1
 1:
-        lwarx	r4,0,r3
+        lwarx	r4,0,r5
         cmpwi	r4,0
         bne-	2f
-        stwcx.	r3,0,r3
+        stwcx.	r5,0,r5
         isync				// cancel speculative execution
         beqlr+
         b		1b
@@ -75,11 +77,13 @@ spinlock_32_try_mp:
         
 
 spinlock_32_try_up:
+	mr	r5, r3
+	li	r3, 1
 1:
-        lwarx	r4,0,r3
+        lwarx	r4,0,r5
         cmpwi	r4,0
         bne-	2f
-        stwcx.	r3,0,r3
+        stwcx.	r5,0,r5
         beqlr+
         b		1b
 2:
@@ -137,17 +141,19 @@ spinlock_32_unlock_up:
 
 
 spinlock_64_try_mp:
+	mr	r5, r3
+	li	r3, 1
 1:
-        lwarx	r4,0,r3
+        lwarx	r4,0,r5
         cmpwi	r4,0
         bne--	2f
-        stwcx.	r3,0,r3
+        stwcx.	r5,0,r5
         isync				// cancel speculative execution
         beqlr++
         b		1b
 2:
         li		r6,-4
-        stwcx.	r3,r6,r1	// clear the pending reservation (using red zone)
+        stwcx.	r5,r6,r1	// clear the pending reservation (using red zone)
         li		r3,0		// Pass failure
         blr
 
@@ -155,16 +161,18 @@ spinlock_64_try_mp:
 
 
 spinlock_64_try_up:
+	mr	r5, r3
+	li	r3, 1
 1:
-        lwarx	r4,0,r3
+        lwarx	r4,0,r5
         cmpwi	r4,0
         bne--	2f
-        stwcx.	r3,0,r3
+        stwcx.	r5,0,r5
         beqlr++
         b		1b
 2:
         li		r6,-4
-        stwcx.	r3,r6,r1	// clear the pending reservation (using red zone)
+        stwcx.	r5,r6,r1	// clear the pending reservation (using red zone)
         li		r3,0
         blr
 

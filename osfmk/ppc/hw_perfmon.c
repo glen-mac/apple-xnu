@@ -748,18 +748,18 @@ int perfmon_set_tbsel(thread_act_t thr_act, int tbsel)
 
 int perfmon_control(struct savearea *ssp)
 {
-	mach_port_t thr_port = (mach_port_t)ssp->save_r3;
+	mach_port_t thr_port = CAST_DOWN(mach_port_t, ssp->save_r3); 
 	int action = (int)ssp->save_r4;
 	int pmc = (int)ssp->save_r5;
 	int val = (int)ssp->save_r6;
-	uint64_t *usr_pmcs_p = (uint64_t *)ssp->save_r7;
+	uint64_t *usr_pmcs_p = CAST_DOWN(uint64_t *, ssp->save_r7);
 	thread_act_t thr_act = THREAD_NULL;
 	uint64_t kern_pmcs[MAX_CPUPMC_COUNT];
 	kern_return_t retval = KERN_SUCCESS;
 	int error;  
 	boolean_t oldlevel;
 
-	thr_act = port_name_to_act(thr_port); // convert user space thread port name to a thread_act_t
+	thr_act = (thread_act_t) port_name_to_act(thr_port); // convert user space thread port name to a thread_act_t
 	if(!thr_act) {
 		ssp->save_r3 = KERN_INVALID_ARGUMENT;
 		return 1;  /* Return and check for ASTs... */

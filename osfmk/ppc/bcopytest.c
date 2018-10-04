@@ -27,7 +27,7 @@
 #include <ppc/mappings.h>
 #include <ddb/db_output.h>
 
-#include <ppc/POWERMAC/video_console.h>		/* (TEST/DEBUG) */
+#include <console/video_console.h>		/* (TEST/DEBUG) */
 
 #define patper 253
 
