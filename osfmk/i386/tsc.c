@@ -1,29 +1,23 @@
 /*
  * Copyright (c) 2005-2006 Apple Computer, Inc. All rights reserved.
  *
- * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
+ * @APPLE_LICENSE_HEADER_START@
  * 
- * This file contains Original Code and/or Modifications of Original Code
- * as defined in and that are subject to the Apple Public Source License
- * Version 2.0 (the 'License'). You may not use this file except in
- * compliance with the License. The rights granted to you under the License
- * may not be used to create, or enable the creation or redistribution of,
- * unlawful or unlicensed copies of an Apple operating system, or to
- * circumvent, violate, or enable the circumvention or violation of, any
- * terms of an Apple operating system software license agreement.
+ * The contents of this file constitute Original Code as defined in and
+ * are subject to the Apple Public Source License Version 1.1 (the
+ * "License").  You may not use this file except in compliance with the
+ * License.  Please obtain a copy of the License at
+ * http://www.apple.com/publicsource and read it before using this file.
  * 
- * Please obtain a copy of the License at
- * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
- * The Original Code and all software distributed under the License are
- * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * This Original Code and all software distributed under the License are
+ * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
  * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
- * Please see the License for the specific language governing rights and
- * limitations under the License.
+ * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
+ * License for the specific language governing rights and limitations
+ * under the License.
  * 
- * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+ * @APPLE_LICENSE_HEADER_END@
  */
 /*
  * @OSF_COPYRIGHT@
@@ -129,9 +123,7 @@ tsc_init(void)
 {
     uint64_t	busFreq;
     uint64_t	busFCvtInt;
-    uint32_t	cpuModel;
-    uint32_t	cpuFamily;
-    uint32_t	xcpuid[4];
+    uint32_t	cpuFamily  = cpuid_info()->cpuid_family;
 
     /*
      * Get the FSB frequency and conversion factors.
@@ -154,37 +146,16 @@ tsc_init(void)
 	    (uint32_t)(busFCvtn2t >> 32), (uint32_t)busFCvtn2t,
 	    (uint32_t)(busFCvtInt >> 32), (uint32_t)busFCvtInt);
 
-    do_cpuid(1, xcpuid);
-    cpuFamily = ( xcpuid[eax] >> 8 ) & 0xf;
-    /*
-     * Get the extended family if necessary.
-     */
-    if (cpuFamily == 0x0f)
-	cpuFamily += (xcpuid[eax] >> 20) & 0x00ff;
-
-    cpuModel = ( xcpuid[eax] >> 4 ) & 0xf;
-    /*
-     * Get the extended model if necessary.
-     */
-    if (cpuFamily == CPUID_FAMILY_686
-	|| cpuFamily == CPUID_FAMILY_EXTENDED)
-	cpuModel += ((xcpuid[eax] >> 16) & 0xf) << 4;
-
     /*
      * Get the TSC increment.  The TSC is incremented by this
      * on every bus tick.  Calculate the TSC conversion factors
      * to and from nano-seconds.
      */
     if (cpuFamily == CPUID_FAMILY_686) {
-	if (cpuModel == CPUID_MODEL_CORE || cpuModel == CPUID_MODEL_CORE2) {
 	uint64_t	prfsts;
 	
 	prfsts = rdmsr64(IA32_PERF_STS);
 	tscGranularity = (uint32_t)(prfsts >> BusRatioShift) & BusRatioMask;
-	} else {
-	    panic("rtclock_init: unknown CPU model: 0x%X\n",
-	      cpuModel);
-	}
     } else {
 	panic("rtclock_init: unknown CPU family: 0x%X\n",
 	      cpuFamily);
