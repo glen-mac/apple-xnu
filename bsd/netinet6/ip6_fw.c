@@ -1,4 +1,56 @@
-/*	$KAME: ip6_fw.c,v 1.11 2000/03/10 04:22:18 k-sugyou Exp $	*/
+/*
+ * Copyright (c) 2003 Apple Computer, Inc. All rights reserved.
+ *
+ * @APPLE_LICENSE_HEADER_START@
+ * 
+ * The contents of this file constitute Original Code as defined in and
+ * are subject to the Apple Public Source License Version 1.1 (the
+ * "License").  You may not use this file except in compliance with the
+ * License.  Please obtain a copy of the License at
+ * http://www.apple.com/publicsource and read it before using this file.
+ * 
+ * This Original Code and all software distributed under the License are
+ * distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
+ * License for the specific language governing rights and limitations
+ * under the License.
+ * 
+ * @APPLE_LICENSE_HEADER_END@
+ */
+
+/*	$FreeBSD: src/sys/netinet6/ip6_fw.c,v 1.2.2.9 2002/04/28 05:40:27 suz Exp $	*/
+/*	$KAME: ip6_fw.c,v 1.21 2001/01/24 01:25:32 itojun Exp $	*/
+
+/*
+ * Copyright (C) 1998, 1999, 2000 and 2001 WIDE Project.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the project nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
 
 /*
  * Copyright (c) 1993 Daniel Boulet
@@ -13,38 +65,33 @@
  * but requiring it would be too onerous.
  *
  * This software is provided ``AS IS'' without any warranties of any kind.
- *
- *	$Id: ip6_fw.c,v 1.3 2001/05/01 21:52:50 lindak Exp $
  */
 
 /*
  * Implement IPv6 packet firewall
  */
 
-#ifdef __FreeBSD__
-#include "opt_ip6fw.h"
-#if __FreeBSD__ >= 3
-#include "opt_inet.h"
+
+#ifdef IP6DIVERT
+#error "NOT SUPPORTED IPV6 DIVERT"
 #endif
+#ifdef IP6FW_DIVERT_RESTART
+#error "NOT SUPPORTED IPV6 DIVERT"
 #endif
 
-#if IP6DIVERT
-#error "NOT SUPPORTED IPV6 DIVERT"
-#endif
-#if IP6FW_DIVERT_RESTART
-#error "NOT SUPPORTED IPV6 DIVERT"
-#endif
+#include <string.h>
+#include <machine/spl.h>
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
-#include <kern/queue.h>
+#include <sys/queue.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3 || defined (__APPLE__)
 #include <sys/socketvar.h>
-#endif
+#include <sys/syslog.h>
+#include <sys/lock.h>
 #include <sys/time.h>
 #include <net/if.h>
 #include <net/route.h>
@@ -60,11 +107,6 @@
 #include <netinet/in_pcb.h>
 
 #include <netinet6/ip6_fw.h>
-#if TCP6
-#include <netinet6/tcp6.h>
-#include <netinet6/tcp6_timer.h>
-#include <netinet6/tcp6_var.h>
-#endif
 #include <netinet/ip_var.h>
 #include <netinet/tcp.h>
 #include <netinet/tcp_seq.h>
@@ -72,30 +114,19 @@
 #include <netinet/tcp_var.h>
 #include <netinet/udp.h>
 
-#if defined(__NetBSD__) || defined(__OpenBSD__)
-#include <vm/vm.h>
-#endif
-#if __FreeBSD__ || defined (__APPLE__)
 #include <sys/sysctl.h>
-#endif
 
 #include <net/net_osdep.h>
 
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3
 MALLOC_DEFINE(M_IP6FW, "Ip6Fw/Ip6Acct", "Ip6Fw/Ip6Acct chain's");
-#else
-#ifndef M_IP6FW
-#define M_IP6FW	M_TEMP
-#endif
-#endif
 
 static int fw6_debug = 1;
-#if IPV6FIREWALL_VERBOSE
+#ifdef IPV6FIREWALL_VERBOSE
 static int fw6_verbose = 1;
 #else
 static int fw6_verbose = 0;
 #endif
-#if IPV6FIREWALL_VERBOSE_LIMIT
+#ifdef IPV6FIREWALL_VERBOSE_LIMIT
 static int fw6_verbose_limit = IPV6FIREWALL_VERBOSE_LIMIT;
 #else
 static int fw6_verbose_limit = 0;
@@ -103,23 +134,26 @@ static int fw6_verbose_limit = 0;
 
 LIST_HEAD (ip6_fw_head, ip6_fw_chain) ip6_fw_chain;
 
+#ifdef SYSCTL_NODE
 SYSCTL_DECL(_net_inet6_ip6);
 SYSCTL_NODE(_net_inet6_ip6, OID_AUTO, fw, CTLFLAG_RW, 0, "Firewall");
-SYSCTL_INT(_net_inet6_ip6_fw, IP6FWCTL_DEBUG, debug, CTLFLAG_RW, &fw6_debug, 0, "");
-SYSCTL_INT(_net_inet6_ip6_fw, IP6FWCTL_VERBOSE, verbose, CTLFLAG_RW, &fw6_verbose, 0, "");
-SYSCTL_INT(_net_inet6_ip6_fw, IP6FWCTL_VERBLIMIT, verbose_limit, CTLFLAG_RW, &fw6_verbose_limit, 0, "");
+SYSCTL_INT(_net_inet6_ip6_fw, OID_AUTO, enable, CTLFLAG_RW,
+	&ip6_fw_enable, 0, "Enable ip6fw");
+SYSCTL_INT(_net_inet6_ip6_fw, OID_AUTO, debug, CTLFLAG_RW, &fw6_debug, 0, "");
+SYSCTL_INT(_net_inet6_ip6_fw, OID_AUTO, verbose, CTLFLAG_RW, &fw6_verbose, 0, "");
+SYSCTL_INT(_net_inet6_ip6_fw, OID_AUTO, verbose_limit, CTLFLAG_RW, &fw6_verbose_limit, 0, "");
+#endif
 
-#define dprintf(a)	if (!fw6_debug); else printf a
-
-#define print_ip6(a)	printf("[%s]", ip6_sprintf(a))
-
-#define dprint_ip6(a)	if (!fw6_debug); else print_ip6(a)
+#define dprintf(a)	do {						\
+				if (fw6_debug)				\
+					printf a;			\
+			} while (0)
+#define SNPARGS(buf, len) buf + len, sizeof(buf) > len ? sizeof(buf) - len : 0
 
 static int	add_entry6 __P((struct ip6_fw_head *chainptr, struct ip6_fw *frwl));
 static int	del_entry6 __P((struct ip6_fw_head *chainptr, u_short number));
-static int	zero_entry6 __P((struct mbuf *m));
+static int	zero_entry6 __P((struct ip6_fw *frwl));
 static struct ip6_fw *check_ip6fw_struct __P((struct ip6_fw *m));
-static struct ip6_fw *check_ip6fw_mbuf __P((struct mbuf *fw));
 static int	ip6opts_match __P((struct ip6_hdr **ip6, struct ip6_fw *f,
 				   struct mbuf **m,
 				   int *off, int *nxt, u_short *offset));
@@ -132,20 +166,16 @@ static void	ip6fw_report __P((struct ip6_fw *f, struct ip6_hdr *ip6,
 
 static int	ip6_fw_chk __P((struct ip6_hdr **pip6,
 			struct ifnet *oif, u_int16_t *cookie, struct mbuf **m));
-static int	ip6_fw_ctl __P((int stage, struct mbuf **mm));
+static int	ip6_fw_ctl __P((struct sockopt *));
 
 static char err_prefix[] = "ip6_fw_ctl:";
+extern lck_mtx_t *ip6_mutex;
 
 /*
  * Returns 1 if the port is matched by the vector, 0 otherwise
  */
 static
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3
-__inline
-#else
-inline
-#endif
-int
+__inline int
 port_match6(u_short *portptr, int nports, u_short port, int range_flag)
 {
 	if (!nports)
@@ -170,9 +200,15 @@ tcp6flg_match(struct tcphdr *tcp6, struct ip6_fw *f)
 {
 	u_char		flg_set, flg_clr;
 	
-	if ((f->fw_tcpf & IPV6_FW_TCPF_ESTAB) &&
-	    (tcp6->th_flags & (IPV6_FW_TCPF_RST | IPV6_FW_TCPF_ACK)))
-		return 1;
+	/*
+	 * If an established connection is required, reject packets that
+	 * have only SYN of RST|ACK|SYN set.  Otherwise, fall through to
+	 * other flag requirements.
+	 */
+	if ((f->fw_ipflg & IPV6_FW_IF_TCPEST) &&
+	    ((tcp6->th_flags & (IPV6_FW_TCPF_RST | IPV6_FW_TCPF_ACK |
+	    IPV6_FW_TCPF_SYN)) == IPV6_FW_TCPF_SYN))
+		return 0;
 
 	flg_set = tcp6->th_flags & f->fw_tcpf;
 	flg_clr = tcp6->th_flags & f->fw_tcpnf;
@@ -245,11 +281,11 @@ ip6opts_match(struct ip6_hdr **pip6, struct ip6_fw *f, struct mbuf **m,
 
 		switch(*nxt) {
 		case IPPROTO_FRAGMENT:
-			if ((*m)->m_len < *off + sizeof(struct ip6_frag)) {
+			if ((*m)->m_len >= *off + sizeof(struct ip6_frag)) {
 				struct ip6_frag *ip6f;
 
 				ip6f = (struct ip6_frag *) ((caddr_t)ip6 + *off);
-				*offset = ip6f->ip6f_offlg | IP6F_OFF_MASK;
+				*offset = ip6f->ip6f_offlg & IP6F_OFF_MASK;
 			}
 			opts &= ~IPV6_FW_IP6OPT_FRAG;
 			nopts &= ~IPV6_FW_IP6OPT_FRAG;
@@ -304,42 +340,24 @@ ip6opts_match(struct ip6_hdr **pip6, struct ip6_fw *f, struct mbuf **m,
 }
 
 static
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3
-__inline
-#else
-inline
-#endif
-int
+__inline int
 iface_match(struct ifnet *ifp, union ip6_fw_if *ifu, int byname)
 {
 	/* Check by name or by IP address */
 	if (byname) {
-#if __NetBSD__
-	    {
-		char xname[IFNAMSIZ];
-		snprintf(xname, sizeof(xname), "%s%d", ifu->fu_via_if.name,
-			ifu->fu_via_if.unit);
-		if (strcmp(ifp->if_xname, xname))
-			return(0);
-	    }
-#else
 		/* Check unit number (-1 is wildcard) */
 		if (ifu->fu_via_if.unit != -1
 		    && ifp->if_unit != ifu->fu_via_if.unit)
 			return(0);
 		/* Check name */
-		if (strncmp(ifp->if_name, ifu->fu_via_if.name, FW_IFNLEN))
+		if (strncmp(ifp->if_name, ifu->fu_via_if.name, IP6FW_IFNLEN))
 			return(0);
-#endif
 		return(1);
 	} else if (!IN6_IS_ADDR_UNSPECIFIED(&ifu->fu_via_ip6)) {	/* Zero == wildcard */
 		struct ifaddr *ia;
 
-#if defined(__bsdi__) || (defined(__FreeBSD__) && __FreeBSD__ < 3)
-		for (ia = ifp->if_addrlist; ia; ia = ia->ifa_next)
-#else
+		ifnet_lock_shared(ifp);
 		for (ia = ifp->if_addrlist.tqh_first; ia; ia = ia->ifa_list.tqe_next)
-#endif
 		{
 
 			if (ia->ifa_addr == NULL)
@@ -348,10 +366,12 @@ iface_match(struct ifnet *ifp, union ip6_fw_if *ifu, int byname)
 				continue;
 			if (!IN6_ARE_ADDR_EQUAL(&ifu->fu_via_ip6,
 			    &(((struct sockaddr_in6 *)
-			    (ia->ifa_addr))->sin6_addr)))
+			    (ia->ifa_addr))->sin6_addr))) 
 				continue;
+			ifnet_lock_done(ifp);
 			return(1);
 		}
+		ifnet_lock_done(ifp);
 		return(0);
 	}
 	return(1);
@@ -366,93 +386,114 @@ ip6fw_report(struct ip6_fw *f, struct ip6_hdr *ip6,
 	struct udphdr *const udp = (struct udphdr *) ((caddr_t) ip6+ off);
 	struct icmp6_hdr *const icmp6 = (struct icmp6_hdr *) ((caddr_t) ip6+ off);
 	int count;
+	char *action;
+	char action2[32], proto[102], name[18];
+	int len;
 
 	count = f ? f->fw_pcnt : ++counter;
 	if (fw6_verbose_limit != 0 && count > fw6_verbose_limit)
 		return;
 
 	/* Print command name */
-	printf("ip6fw: %d ", f ? f->fw_number : -1);
+	snprintf(SNPARGS(name, 0), "ip6fw: %d", f ? f->fw_number : -1);
+
+	action = action2;
 	if (!f)
-		printf("Refuse");
-	else
+		action = "Refuse";
+	else {
 		switch (f->fw_flg & IPV6_FW_F_COMMAND) {
 		case IPV6_FW_F_DENY:
-			printf("Deny");
+			action = "Deny";
 			break;
 		case IPV6_FW_F_REJECT:
 			if (f->fw_reject_code == IPV6_FW_REJECT_RST)
-				printf("Reset");
+				action = "Reset";
 			else
-				printf("Unreach");
+				action = "Unreach";
 			break;
 		case IPV6_FW_F_ACCEPT:
-			printf("Accept");
+			action = "Accept";
 			break;
 		case IPV6_FW_F_COUNT:
-			printf("Count");
+			action = "Count";
 			break;
 		case IPV6_FW_F_DIVERT:
-			printf("Divert %d", f->fw_divert_port);
+			snprintf(SNPARGS(action2, 0), "Divert %d",
+			    f->fw_divert_port);
 			break;
 		case IPV6_FW_F_TEE:
-			printf("Tee %d", f->fw_divert_port);
+			snprintf(SNPARGS(action2, 0), "Tee %d",
+			    f->fw_divert_port);
 			break;
 		case IPV6_FW_F_SKIPTO:
-			printf("SkipTo %d", f->fw_skipto_rule);
+			snprintf(SNPARGS(action2, 0), "SkipTo %d",
+			    f->fw_skipto_rule);
 			break;
 		default:	
-			printf("UNKNOWN");
+			action = "UNKNOWN";
 			break;
 		}
-	printf(" ");
+	}
 
 	switch (nxt) {
 	case IPPROTO_TCP:
-		printf("TCP ");
-		print_ip6(&ip6->ip6_src);
+		len = snprintf(SNPARGS(proto, 0), "TCP [%s]",
+		    ip6_sprintf(&ip6->ip6_src));
 		if (off > 0)
-			printf(":%d ", ntohs(tcp6->th_sport));
+			len += snprintf(SNPARGS(proto, len), ":%d ",
+			    ntohs(tcp6->th_sport));
 		else
-			printf(" ");
-		print_ip6(&ip6->ip6_dst);
+			len += snprintf(SNPARGS(proto, len), " ");
+		len += snprintf(SNPARGS(proto, len), "[%s]",
+		    ip6_sprintf(&ip6->ip6_dst));
 		if (off > 0)
-			printf(":%d", ntohs(tcp6->th_dport));
+			snprintf(SNPARGS(proto, len), ":%d",
+			    ntohs(tcp6->th_dport));
 		break;
 	case IPPROTO_UDP:
-		printf("UDP ");
-		print_ip6(&ip6->ip6_src);
+		len = snprintf(SNPARGS(proto, 0), "UDP [%s]",
+		    ip6_sprintf(&ip6->ip6_src));
 		if (off > 0)
-			printf(":%d ", ntohs(udp->uh_sport));
+			len += snprintf(SNPARGS(proto, len), ":%d ",
+			    ntohs(udp->uh_sport));
 		else
-			printf(" ");
-		print_ip6(&ip6->ip6_dst);
+		    len += snprintf(SNPARGS(proto, len), " ");
+		len += snprintf(SNPARGS(proto, len), "[%s]",
+		    ip6_sprintf(&ip6->ip6_dst));
 		if (off > 0)
-			printf(":%d", ntohs(udp->uh_dport));
+			snprintf(SNPARGS(proto, len), ":%d",
+			    ntohs(udp->uh_dport));
 		break;
 	case IPPROTO_ICMPV6:
 		if (off > 0)
-			printf("IPV6-ICMP:%u.%u ", icmp6->icmp6_type, icmp6->icmp6_code);
+			len = snprintf(SNPARGS(proto, 0), "IPV6-ICMP:%u.%u ",
+			    icmp6->icmp6_type, icmp6->icmp6_code);
 		else
-			printf("IPV6-ICMP ");
-		print_ip6(&ip6->ip6_src);
-		printf(" ");
-		print_ip6(&ip6->ip6_dst);
+			len = snprintf(SNPARGS(proto, 0), "IPV6-ICMP ");
+		len += snprintf(SNPARGS(proto, len), "[%s]",
+		    ip6_sprintf(&ip6->ip6_src));
+		snprintf(SNPARGS(proto, len), " [%s]",
+		    ip6_sprintf(&ip6->ip6_dst));
 		break;
 	default:
-		printf("P:%d ", nxt);
-		print_ip6(&ip6->ip6_src);
-		printf(" ");
-		print_ip6(&ip6->ip6_dst);
+		len = snprintf(SNPARGS(proto, 0), "P:%d [%s]", nxt,
+		    ip6_sprintf(&ip6->ip6_src));
+		snprintf(SNPARGS(proto, len), " [%s]",
+		    ip6_sprintf(&ip6->ip6_dst));
 		break;
 	}
+
 	if (oif)
-		printf(" out via %s", if_name(oif));
+		log(LOG_AUTHPRIV | LOG_INFO, "%s %s %s out via %s\n",
+		    name, action, proto, if_name(oif));
 	else if (rif)
-		printf(" in via %s", if_name(rif));
-	printf("\n");
+		log(LOG_AUTHPRIV | LOG_INFO, "%s %s %s in via %s\n",
+		    name, action, proto, if_name(rif));
+	else
+		log(LOG_AUTHPRIV | LOG_INFO, "%s %s %s",
+		    name, action, proto);
 	if (fw6_verbose_limit != 0 && count == fw6_verbose_limit)
-		printf("ip6fw: limit reached on rule #%d\n",
+	    log(LOG_AUTHPRIV | LOG_INFO, "ip6fw: limit reached on entry %d\n",
 		f ? f->fw_number : -1);
 }
 
@@ -488,21 +529,24 @@ ip6_fw_chk(struct ip6_hdr **pip6,
 	u_short offset = 0;
 	int off = sizeof(struct ip6_hdr), nxt = ip6->ip6_nxt;
 	u_short src_port, dst_port;
-#if	IP6FW_DIVERT_RESTART
+#ifdef	IP6FW_DIVERT_RESTART
 	u_int16_t skipto = *cookie;
 #else
 	u_int16_t ignport = ntohs(*cookie);
 #endif
+	struct timeval timenow;
+
+	getmicrotime(&timenow);
 
 	*cookie = 0;
 	/*
 	 * Go down the chain, looking for enlightment
-	 * #if IP6FW_DIVERT_RESTART
+	 * #ifdef IP6FW_DIVERT_RESTART
 	 * If we've been asked to start at a given rule immediatly, do so.
 	 * #endif
 	 */
 	chain = LIST_FIRST(&ip6_fw_chain);
-#if IP6FW_DIVERT_RESTART
+#ifdef IP6FW_DIVERT_RESTART
 	if (skipto) {
 		if (skipto >= 65535)
 			goto dropit;
@@ -513,7 +557,7 @@ ip6_fw_chk(struct ip6_hdr **pip6,
 	}
 #endif /* IP6FW_DIVERT_RESTART */
 	for (; chain; chain = LIST_NEXT(chain, chain)) {
-		register struct ip6_fw *const f = chain->rule;
+		struct ip6_fw *const f = chain->rule;
 
 		if (oif) {
 			/* Check direction outbound */
@@ -611,7 +655,9 @@ ip6_fw_chk(struct ip6_hdr **pip6,
 			}
 			PULLUP_TO(off + 14);
 			tcp6 = (struct tcphdr *) ((caddr_t)ip6 + off);
-			if (f->fw_tcpf != f->fw_tcpnf && !tcp6flg_match(tcp6, f))
+			if (((f->fw_tcpf != f->fw_tcpnf) ||
+			   (f->fw_ipflg & IPV6_FW_IF_TCPEST))  &&
+			   !tcp6flg_match(tcp6, f))
 				continue;
 			src_port = ntohs(tcp6->th_sport);
 			dst_port = ntohs(tcp6->th_dport);
@@ -684,11 +730,7 @@ got_match:
 		/* Update statistics */
 		f->fw_pcnt += 1;
 		f->fw_bcnt += ntohs(ip6->ip6_plen);
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3
-		f->timestamp = time_second;
-#else
-		f->timestamp = time.tv_sec;
-#endif
+		f->timestamp = timenow.tv_sec;
 
 		/* Log to console if desired */
 		if ((f->fw_flg & IPV6_FW_F_PRN) && fw6_verbose)
@@ -701,7 +743,7 @@ got_match:
 		case IPV6_FW_F_COUNT:
 			continue;
 		case IPV6_FW_F_DIVERT:
-#if IP6FW_DIVERT_RESTART
+#ifdef IP6FW_DIVERT_RESTART
 			*cookie = f->fw_number;
 #else
 			*cookie = htons(f->fw_divert_port);
@@ -718,7 +760,7 @@ got_match:
 			 */
 			continue;
 		case IPV6_FW_F_SKIPTO:
-#if DIAGNOSTIC
+#ifdef DIAGNOSTIC
 			while (chain->chain.le_next
 			    && chain->chain.le_next->rule->fw_number
 				< f->fw_skipto_rule)
@@ -735,7 +777,7 @@ got_match:
 		break;
 	}
 
-#if DIAGNOSTIC
+#ifdef DIAGNOSTIC
 	/* Rule 65535 should always be there and should always match */
 	if (!chain)
 		panic("ip6_fw: chain");
@@ -755,7 +797,6 @@ got_match:
 	    && !IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
 		switch (rule->fw_reject_code) {
 		case IPV6_FW_REJECT_RST:
-#if 1	/*not tested*/
 		  {
 			struct tcphdr *const tcp =
 				(struct tcphdr *) ((caddr_t)ip6 + off);
@@ -771,8 +812,8 @@ got_match:
 
 			ti.ip6 = *ip6;
 			ti.th = *tcp;
-			NTOHL(ti.th.th_seq);
-			NTOHL(ti.th.th_ack);
+			ti.th.th_seq = ntohl(ti.th.th_seq);
+			ti.th.th_ack = ntohl(ti.th.th_ack);
 			ti.ip6.ip6_nxt = IPPROTO_TCP;
 			if (ti.th.th_flags & TH_ACK) {
 				ack = 0;
@@ -795,27 +836,19 @@ got_match:
 				flags = TH_RST|TH_ACK;
 			}
 			bcopy(&ti, ip6, sizeof(ti));
-#if TCP6
-			tcp6_respond(NULL, ip6, (struct tcp6hdr *)(ip6 + 1),
-				*m, ack, seq, flags);
-#elif defined(__NetBSD__)
-			tcp_respond(NULL, NULL, *m, (struct tcphdr *)(ip6 + 1),
-				ack, seq, flags);
-#elif defined(__FreeBSD__) && __FreeBSD__ >= 3 || defined (__APPLE__)
 			tcp_respond(NULL, ip6, (struct tcphdr *)(ip6 + 1),
-				*m, ack, seq, flags, 1);
-#else
-			m_freem(*m);
-#endif
+				*m, ack, seq, flags);
 			*m = NULL;
 			break;
 		  }
-#endif
 		default:	/* Send an ICMP unreachable using code */
 			if (oif)
 				(*m)->m_pkthdr.rcvif = oif;
+			lck_mtx_assert(ip6_mutex, LCK_MTX_ASSERT_OWNED);
+			lck_mtx_unlock(ip6_mutex);
 			icmp6_error(*m, ICMP6_DST_UNREACH,
 			    rule->fw_reject_code, 0);
+			lck_mtx_lock(ip6_mutex);
 			*m = NULL;
 			break;
 		}
@@ -840,17 +873,17 @@ add_entry6(struct ip6_fw_head *chainptr, struct ip6_fw *frwl)
 	u_short nbr = 0;
 	int s;
 
-	fwc = _MALLOC(sizeof *fwc, M_IP6FW, M_NOWAIT);
-	ftmp = _MALLOC(sizeof *ftmp, M_IP6FW, M_NOWAIT);
+	fwc = _MALLOC(sizeof *fwc, M_IP6FW, M_WAITOK);
+	ftmp = _MALLOC(sizeof *ftmp, M_IP6FW, M_WAITOK);
 	if (!fwc || !ftmp) {
 		dprintf(("%s malloc said no\n", err_prefix));
-		if (fwc)  _FREE(fwc, M_IP6FW);
-		if (ftmp) _FREE(ftmp, M_IP6FW);
+		if (fwc)  FREE(fwc, M_IP6FW);
+		if (ftmp) FREE(ftmp, M_IP6FW);
 		return (ENOSPC);
 	}
 
 	bcopy(frwl, ftmp, sizeof(struct ip6_fw));
-	ftmp->fw_in_if.fu_via_if.name[FW_IFNLEN - 1] = '\0';
+	ftmp->fw_in_if.fu_via_if.name[IP6FW_IFNLEN - 1] = '\0';
 	ftmp->fw_pcnt = 0L;
 	ftmp->fw_bcnt = 0L;
 	fwc->rule = ftmp;
@@ -862,8 +895,8 @@ add_entry6(struct ip6_fw_head *chainptr, struct ip6_fw *frwl)
 		splx(s);
 		return(0);
         } else if (ftmp->fw_number == (u_short)-1) {
-		if (fwc)  _FREE(fwc, M_IP6FW);
-		if (ftmp) _FREE(ftmp, M_IP6FW);
+		if (fwc)  FREE(fwc, M_IP6FW);
+		if (ftmp) FREE(ftmp, M_IP6FW);
 		splx(s);
 		dprintf(("%s bad rule number\n", err_prefix));
 		return (EINVAL);
@@ -914,8 +947,8 @@ del_entry6(struct ip6_fw_head *chainptr, u_short number)
 			if (fcp->rule->fw_number == number) {
 				LIST_REMOVE(fcp, chain);
 				splx(s);
-				_FREE(fcp->rule, M_IP6FW);
-				_FREE(fcp, M_IP6FW);
+				FREE(fcp->rule, M_IP6FW);
+				FREE(fcp, M_IP6FW);
 				return 0;
 			}
 		}
@@ -926,19 +959,10 @@ del_entry6(struct ip6_fw_head *chainptr, u_short number)
 }
 
 static int
-zero_entry6(struct mbuf *m)
+zero_entry6(struct ip6_fw *frwl)
 {
-	struct ip6_fw *frwl;
 	struct ip6_fw_chain *fcp;
 	int s;
-
-	if (m) {
-		if (m->m_len != sizeof(struct ip6_fw))
-			return(EINVAL);
-		frwl = mtod(m, struct ip6_fw *);
-	}
-	else
-		frwl = NULL;
 
 	/*
 	 *	It's possible to insert multiple chain entries with the
@@ -947,7 +971,7 @@ zero_entry6(struct mbuf *m)
 	 */
 	s = splnet();
 	for (fcp = ip6_fw_chain.lh_first; fcp; fcp = fcp->chain.le_next)
-		if (!frwl || frwl->fw_number == fcp->rule->fw_number) {
+		if (!frwl || frwl->fw_number == 0 || frwl->fw_number == fcp->rule->fw_number) {
 			fcp->rule->fw_bcnt = fcp->rule->fw_pcnt = 0;
 			fcp->rule->timestamp = 0;
 		}
@@ -955,24 +979,14 @@ zero_entry6(struct mbuf *m)
 
 	if (fw6_verbose) {
 		if (frwl)
-			printf("ip6fw: Entry %d cleared.\n", frwl->fw_number);
+			log(LOG_AUTHPRIV | LOG_NOTICE,
+			    "ip6fw: Entry %d cleared.\n", frwl->fw_number);
 		else
-			printf("ip6fw: Accounting cleared.\n");
+			log(LOG_AUTHPRIV | LOG_NOTICE,
+			    "ip6fw: Accounting cleared.\n");
 	}
 
 	return(0);
-}
-
-static struct ip6_fw *
-check_ip6fw_mbuf(struct mbuf *m)
-{
-	/* Check length */
-	if (m->m_len != sizeof(struct ip6_fw)) {
-		dprintf(("%s len=%d, want %d\n", err_prefix, m->m_len,
-		    sizeof(struct ip6_fw)));
-		return (NULL);
-	}
-	return(check_ip6fw_struct(mtod(m, struct ip6_fw *)));
 }
 
 static struct ip6_fw *
@@ -1094,6 +1108,8 @@ check_ip6fw_struct(struct ip6_fw *frwl)
 	return frwl;
 }
 
+/*#####*/
+#if 0
 static int
 ip6_fw_ctl(int stage, struct mbuf **mm)
 {
@@ -1102,11 +1118,7 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 
 	if (stage == IPV6_FW_GET) {
 		struct ip6_fw_chain *fcp = ip6_fw_chain.lh_first;
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3 || defined (__APPLE__)
 		*mm = m = m_get(M_WAIT, MT_DATA); /* XXX */
-#else
-		*mm = m = m_get(M_WAIT, MT_SOOPTS);
-#endif
 		if (!m)
 			return(ENOBUFS);
 		if (sizeof *(fcp->rule) > MLEN) {
@@ -1117,13 +1129,9 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 			}
 		}
 		for (; fcp; fcp = fcp->chain.le_next) {
-			memcpy(m->m_data, fcp->rule, sizeof *(fcp->rule));
+			bcopy(fcp->rule, m->m_data, sizeof *(fcp->rule));
 			m->m_len = sizeof *(fcp->rule);
-#if defined(__FreeBSD__) && __FreeBSD__ >= 3 || defined (__APPLE__)
 			m->m_next = m_get(M_WAIT, MT_DATA); /* XXX */
-#else
-			m->m_next = m_get(M_WAIT, MT_SOOPTS);
-#endif
 			if (!m->m_next) {
 				m_freem(*mm);
 				return(ENOBUFS);
@@ -1150,14 +1158,14 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 		return(EPERM);
 	}
 	if (stage == IPV6_FW_FLUSH) {
-		while (ip6_fw_chain.lh_first != NULL && 
+		while (ip6_fw_chain.lh_first != NULL &&
 		    ip6_fw_chain.lh_first->rule->fw_number != (u_short)-1) {
 			struct ip6_fw_chain *fcp = ip6_fw_chain.lh_first;
 			int s = splnet();
 			LIST_REMOVE(ip6_fw_chain.lh_first, chain);
 			splx(s);
-			_FREE(fcp->rule, M_IP6FW);
-			_FREE(fcp, M_IP6FW);
+			FREE(fcp->rule, M_IP6FW);
+			FREE(fcp, M_IP6FW);
 		}
 		if (m) {
 			(void)m_freem(m);
@@ -1193,7 +1201,7 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 	}
 	if (stage == IPV6_FW_DEL) {
 		if (m->m_len != sizeof(struct ip6_fw)) {
-			dprintf(("%s len=%d, want %d\n", err_prefix, m->m_len,
+			dprintf(("%s len=%ld, want %lu\n", err_prefix, m->m_len,
 			    sizeof(struct ip6_fw)));
 			error = EINVAL;
 		} else if (mtod(m, struct ip6_fw *)->fw_number == (u_short)-1) {
@@ -1216,6 +1224,111 @@ ip6_fw_ctl(int stage, struct mbuf **mm)
 	}
 	return (EINVAL);
 }
+#endif
+
+static int
+ip6_fw_ctl(struct sockopt *sopt)
+{
+	int error = 0;
+	int spl;
+	int valsize;
+	struct ip6_fw rule;
+
+	if (securelevel >= 3 &&
+		(sopt->sopt_dir != SOPT_GET || sopt->sopt_name != IPV6_FW_GET))
+		return (EPERM);
+
+	/* We ALWAYS expect the client to pass in a rule structure so that we can
+	 * check the version of the API that they are using.  In the case of a
+	 * IPV6_FW_GET operation, the first rule of the output buffer passed to us
+	 * must have the version set. */
+	if (!sopt->sopt_val || sopt->sopt_valsize < sizeof rule) return EINVAL;
+
+	/* save sopt->sopt_valsize */
+	valsize = sopt->sopt_valsize;
+	if (error = sooptcopyin(sopt, &rule, sizeof(rule), sizeof(rule)))
+		return error;
+
+	if (rule.version != IPV6_FW_CURRENT_API_VERSION) return EINVAL;
+	rule.version = 0xFFFFFFFF;	/* version is meaningless once rules "make it in the door". */
+
+	switch (sopt->sopt_name)
+	{
+		case IPV6_FW_GET:
+		{
+			struct ip6_fw_chain *fcp;
+			struct ip6_fw *buf;
+			size_t size = 0;
+
+			spl = splnet();
+			LIST_FOREACH(fcp, &ip6_fw_chain, chain)
+				size += sizeof *buf;
+
+			buf = _MALLOC(size, M_TEMP, M_WAITOK);
+			if (!buf) error = ENOBUFS;
+			else
+			{
+				struct ip6_fw *bp = buf;
+				LIST_FOREACH(fcp, &ip6_fw_chain, chain)
+				{
+					bcopy(fcp->rule, bp, sizeof *bp);
+					bp->version = IPV6_FW_CURRENT_API_VERSION;
+					bp++;
+				}
+			}
+
+			splx(spl);
+			if (buf)
+			{
+				sopt->sopt_valsize = valsize;
+				error = sooptcopyout(sopt, buf, size);
+				FREE(buf, M_TEMP);
+			}
+
+			break;
+		}
+
+		case IPV6_FW_FLUSH:
+			spl = splnet();
+			while (ip6_fw_chain.lh_first &&
+				ip6_fw_chain.lh_first->rule->fw_number != (u_short)-1)
+			{
+				struct ip6_fw_chain *fcp = ip6_fw_chain.lh_first;
+				LIST_REMOVE(ip6_fw_chain.lh_first, chain);
+				FREE(fcp->rule, M_IP6FW);
+				FREE(fcp, M_IP6FW);
+			}
+			splx(spl);
+			break;
+
+		case IPV6_FW_ZERO:
+			error = zero_entry6(&rule);
+			break;
+
+		case IPV6_FW_ADD:
+			if (check_ip6fw_struct(&rule))
+				error = add_entry6(&ip6_fw_chain, &rule);
+			else
+				error = EINVAL;
+			break;
+
+		case IPV6_FW_DEL:
+			if (rule.fw_number == (u_short)-1)
+			{
+				dprintf(("%s can't delete rule 65535\n", err_prefix));
+				error = EINVAL;
+			}
+			else
+				error = del_entry6(&ip6_fw_chain, rule.fw_number);
+			break;
+
+		default:
+			dprintf(("%s invalid option %d\n", err_prefix, sopt->sopt_name));
+			error = EINVAL;
+	}
+
+	return error;
+}
 
 void
 ip6_fw_init(void)
@@ -1229,7 +1342,7 @@ ip6_fw_init(void)
 	bzero(&default_rule, sizeof default_rule);
 	default_rule.fw_prot = IPPROTO_IPV6;
 	default_rule.fw_number = (u_short)-1;
-#if IPV6FIREWALL_DEFAULT_TO_ACCEPT
+#ifdef IPV6FIREWALL_DEFAULT_TO_ACCEPT
 	default_rule.fw_flg |= IPV6_FW_F_ACCEPT;
 #else
 	default_rule.fw_flg |= IPV6_FW_F_DENY;
@@ -1239,17 +1352,8 @@ ip6_fw_init(void)
 		add_entry6(&ip6_fw_chain, &default_rule))
 		panic(__FUNCTION__);
 
-#if 1	/* NOT SUPPORTED IPV6 DIVERT */
 	printf("IPv6 packet filtering initialized, ");
-#else
-	printf("IPv6 packet filtering initialized, "
-#if IP6DIVERT
-		"divert enabled, ");
-#else
-		"divert disabled, ");
-#endif
-#endif
-#if IPV6FIREWALL_DEFAULT_TO_ACCEPT
+#ifdef IPV6FIREWALL_DEFAULT_TO_ACCEPT
 	printf("default to accept, ");
 #endif
 #ifndef IPV6FIREWALL_VERBOSE
@@ -1262,3 +1366,4 @@ ip6_fw_init(void)
 		    fw6_verbose_limit);
 #endif
 }
+
