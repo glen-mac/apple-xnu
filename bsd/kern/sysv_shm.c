@@ -488,6 +488,7 @@ shmat(struct proc *p, struct shmat_args *uap, user_addr_t *retval)
 			 map_size,
 			 0,
 			 vm_flags,
+			 VM_MAP_KERNEL_FLAGS_NONE,
 			 VM_KERN_MEMORY_NONE,
 			 IPC_PORT_NULL,
 			 0,
@@ -617,7 +618,7 @@ shmctl(__unused struct proc *p, struct shmctl_args *uap, int32_t *retval)
 		}
 
 		if (IS_64BIT_PROCESS(p)) {
-			struct user_shmid_ds shmid_ds;
+			struct user_shmid_ds shmid_ds = {};
 			memcpy(&shmid_ds, &shmseg->u, sizeof(struct user_shmid_ds));
 			
 			/* Clear kernel reserved pointer before copying to user space */
@@ -1045,7 +1046,7 @@ shminit(void)
 			return ENOMEM;
 		}
 
-		MALLOC(shmsegs, struct shmid_kernel *, sz, M_SHM, M_WAITOK);
+		MALLOC(shmsegs, struct shmid_kernel *, sz, M_SHM, M_WAITOK | M_ZERO);
 		if (shmsegs == NULL) {
 			return ENOMEM;
 		}

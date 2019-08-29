@@ -88,6 +88,8 @@ void ml_init_delay_spin_threshold(int);
 
 boolean_t ml_delay_should_spin(uint64_t interval);
 
+extern void ml_delay_on_yield(void);
+
 vm_offset_t
 ml_static_ptovirt(
 	vm_offset_t);
@@ -99,6 +101,12 @@ void ml_static_mfree(
 /* boot memory allocation */
 vm_offset_t ml_static_malloc(
 	vm_size_t size);
+
+vm_offset_t ml_static_slide(
+	vm_offset_t vaddr);
+
+vm_offset_t ml_static_unslide(
+	vm_offset_t vaddr);
 
 /* virtual to physical on wired pages */
 vm_offset_t ml_vtophys(
